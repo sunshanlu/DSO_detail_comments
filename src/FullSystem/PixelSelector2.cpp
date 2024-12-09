@@ -88,7 +88,7 @@ int computeHistQuantil(int *hist, float below) {
  */
 void PixelSelector::makeHists(const FrameHessian *const fh) {
     gradHistFrame = fh;
-    float *mapmax0 = fh->absSquaredGrad[0]; //第0层梯度平方和
+    float *mapmax0 = fh->absSquaredGrad[0]; // 第0层梯度平方和
 
     // weight and height
     int w = wG[0];
@@ -109,7 +109,7 @@ void PixelSelector::makeHists(const FrameHessian *const fh) {
                     int it = i + 32 * x; // 该格里第(j,i)像素的整个图像坐标
                     int jt = j + 32 * y;
                     if (it > w - 2 || jt > h - 2 || it < 1 || jt < 1)
-                        continue;                   //内
+                        continue;                   // 内
                     int g = sqrtf(map0[i + j * w]); // 梯度平方和开根号
                     if (g > 48)
                         g = 48;     //? 为啥是48这个数，因为一共分为了50格
@@ -187,8 +187,7 @@ void PixelSelector::makeHists(const FrameHessian *const fh) {
  * @param thFactor 			阈值因子
  * @return int				选择的点的数量
  */
-int PixelSelector::makeMaps(const FrameHessian *const fh, float *map_out, float density, int recursionsLeft, bool plot,
-                            float thFactor) {
+int PixelSelector::makeMaps(const FrameHessian *const fh, float *map_out, float density, int recursionsLeft, bool plot, float thFactor) {
     float numHave = 0;
     float numWant = density;
     float quotia;
@@ -290,11 +289,9 @@ int PixelSelector::makeMaps(const FrameHessian *const fh, float *map_out, float 
  * @details
  *  1. 对某个pot，进行逐像素的遍历梯度平方和，试图找到满足平滑阈值条件且最大梯度的像素点位置，作为第0层的输出
  *  2. 在2pot * 2pot内，如果4个pot都没有找到平滑阈值条件的像素点位置，则进行0.75倍的阈值缩小
- *      2.1 在2pot * 2pot内，逐像素的遍历点并投影到第1层，试图找到第一层满足
- *          平滑阈值条件且最大梯度的像素点位置，作为第1层的输出
+ *      2.1 在2pot * 2pot内，逐像素的遍历点并投影到第1层，试图找到第一层满足平滑阈值条件且最大梯度的像素点位置，作为第1层的输出
  *  3. 在4pot * 4pot内，如果4个2pot * 2pot都没有找到第一层符合平滑阈值条件的像素点位置，则再次进行0.75倍的阈值缩小
- *      3.1 在4pot * 4pot内，逐像素的遍历点，并投影到第2层，
- *          试图找到第二层满足平滑阈值条件且最大梯度的像素点位置，作为第2层的输出
+ *      3.1 在4pot * 4pot内，逐像素的遍历点，并投影到第2层，试图找到第二层满足平滑阈值条件且最大梯度的像素点位置，作为第2层的输出
  *  4. 这样通过两次梯度减小的方式，可以尝试选择一个大范围小梯度的内的相对大梯度特征点，相当于“瘸子里面选将军！”
  *  5. 这样做的目的
  *      5.1 使用pot的方式，使得观测的选取尽量在一张图片上均匀分布
@@ -324,11 +321,10 @@ Eigen::Vector3i PixelSelector::select(const FrameHessian *const fh, float *map_o
     int h = hG[0];
 
     // 模都是1
-    const Vec2f directions[16] = {
-        Vec2f(0, 1.0000),       Vec2f(0.3827, 0.9239),  Vec2f(0.1951, 0.9808),  Vec2f(0.9239, 0.3827),
-        Vec2f(0.7071, 0.7071),  Vec2f(0.3827, -0.9239), Vec2f(0.8315, 0.5556),  Vec2f(0.8315, -0.5556),
-        Vec2f(0.5556, -0.8315), Vec2f(0.9808, 0.1951),  Vec2f(0.9239, -0.3827), Vec2f(0.7071, -0.7071),
-        Vec2f(0.5556, 0.8315),  Vec2f(0.9808, -0.1951), Vec2f(1.0000, 0.0000),  Vec2f(0.1951, -0.9808)};
+    const Vec2f directions[16] = {Vec2f(0, 1.0000),       Vec2f(0.3827, 0.9239),  Vec2f(0.1951, 0.9808),  Vec2f(0.9239, 0.3827),
+                                  Vec2f(0.7071, 0.7071),  Vec2f(0.3827, -0.9239), Vec2f(0.8315, 0.5556),  Vec2f(0.8315, -0.5556),
+                                  Vec2f(0.5556, -0.8315), Vec2f(0.9808, 0.1951),  Vec2f(0.9239, -0.3827), Vec2f(0.7071, -0.7071),
+                                  Vec2f(0.5556, 0.8315),  Vec2f(0.9808, -0.1951), Vec2f(1.0000, 0.0000),  Vec2f(0.1951, -0.9808)};
 
     /// 将map_out的内容里面的所有默认值都设为0
     memset(map_out, 0, w * h * sizeof(float));
@@ -464,8 +460,7 @@ Eigen::Vector3i PixelSelector::select(const FrameHessian *const fh, float *map_o
                                     if (bestIdx4 == -2)
                                         continue;
 
-                                    float ag2 =
-                                        mapmax2[(int)(xf * 0.25f + 0.125) + (int)(yf * 0.25f + 0.125) * w2]; // 第2层
+                                    float ag2 = mapmax2[(int)(xf * 0.25f + 0.125) + (int)(yf * 0.25f + 0.125) * w2]; // 第2层
                                     if (ag2 > pixelTH2 * thFactor) {
                                         Vec2f ag0d = map0[idx].tail<2>();
                                         float dirNorm = fabsf((float)(ag0d.dot(dir4)));

@@ -453,7 +453,6 @@ int main(int argc, char **argv) {
             /// 	1. 在初始化失败，并且ii已经走到第250帧时，依然进行重置
             /// 	2. 当有系统重置请求的时候，进行系统重置
             if (fullSystem->initFailed || setting_fullResetRequested) {
-
                 if (ii < 250 || setting_fullResetRequested) {
                     printf("RESETTING!\n");
 

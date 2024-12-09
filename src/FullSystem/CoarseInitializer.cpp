@@ -73,131 +73,162 @@ CoarseInitializer::~CoarseInitializer() {
     delete[] JbBuffer_new;
 }
 
+/**
+ * @brief 初始化器中的跟踪frame
+ * @details
+ *  1. 如果上一帧的tji没有满足要求，那么将点的idepth_new，iR和置为1（统一尺度，放弃优化先验），lastHessian置0，如果tji满足要求，则保留先验
+ *  2. 遍历高斯金字塔层级，进行逐层的优化
+ *      2.1 针对非顶层部分，使用金字塔点的父子关系和金字塔点的邻居关系（中值），更新当前层lvl点的期望
+ *      2.2 针对顶层部分，使用邻居值的期望的平均值进行期望更新
+ *      2.3 将lvl层的金字塔点的energy置0
+ *      2.4 计算当前参数下的H，Hsc，b，bsc，以及对应的能量值，作为oldRes
+ *      2.5 遍历当前层的最大迭代次数
+ *          2.5.1 使用Schur的方式，优化delta_x的求解过程，求得优化后的参数 x_new
+ *          2.5.2 使用优化后的参数进行H，Hsc，b，bsc和能量newRes的求解
+ *          2.5.3 如果发生了能量减小的情况，则接受当前lvl层的优化结果，否则不接受当前的优化结果
+ *          2.5.4 若被连续拒绝次数超过2 | 达到最大迭代次数 | 或者优化的增量eps小于阈值，则跳出优化循环
+ *      2.6 使用由粗至精的优化方案，得到一个相对准确的Tji、aji、bji和第0层点的逆深度后
+ *      2.7 从低到高遍历金字塔层级，使用高斯归一化的方式，更新上一层的 逆深度和逆深度期望iR，并考虑邻居点的iR进行期望的平滑处理（中值）
+ *      2.8 维护一个连续优化保证tji满足要求的起始帧id --> snappedAt
+ *      2.9 如果优化中，连续5帧都能保证tji满足要求，则认为初始化成功
+ * @param newFrameHessian   输入的待跟踪的帧j
+ * @param wraps             输入的输出装饰器，用来指定输出结果
+ * @return true     初始化成功
+ * @return false    初始化失败
+ */
 bool CoarseInitializer::trackFrame(FrameHessian *newFrameHessian, std::vector<IOWrap::Output3DWrapper *> &wraps) {
     newFrame = newFrameHessian;
-    //[ ***step 1*** ] 先显示新来的帧
-    // 新的一帧, 在跟踪之前显示的
     for (IOWrap::Output3DWrapper *ow : wraps)
         ow->pushLiveFrame(newFrameHessian);
 
+    /// 定义每一层优化迭代的最大迭代次数
     int maxIterations[] = {5, 5, 10, 30, 50};
 
-    //? 调参
-    alphaK = 2.5 * 2.5; //*freeDebugParam1*freeDebugParam1;
-    alphaW = 150 * 150; //*freeDebugParam2*freeDebugParam2;
-    regWeight = 0.8;    //*freeDebugParam4;
-    couplingWeight = 1; //*freeDebugParam5;
+    /// 用来控制整个优化过程的参数，可以进行动态的调整
+    alphaK = 2.5 * 2.5; ///< 和alphaW一起控制 优化变量tji的大小
+    alphaW = 150 * 150; ///< 和alphaK一起控制 优化变量tji的大小
+    regWeight = 0.8;    ///< iR期望中位数的置信度
+    couplingWeight = 1; ///< tji满足时，逆深度的正则化项部分系数
 
-    //[ ***step 2*** ] 初始化每个点逆深度为1, 初始化光度参数, 位姿SE3
-    if (!snapped) //! snapped应该指的是位移足够大了，不够大就重新优化
+    if (!snapped) /// 若 tji 没有达到 alphaW 和 alphaK 的要求，则需要进行一些修正
     {
-        // 初始化
-        thisToNext.translation().setZero();
+        //! 初始化，这里的初始化直接全部重置，相当于去掉了之前优化的内容，是否会增加初始化时间的内容呢？
+        thisToNext.translation().setZero(); ///< 1. 改变Tji中的平移向量，将之前优化的内容进行置0处理
         for (int lvl = 0; lvl < pyrLevelsUsed; lvl++) {
             int npts = numPoints[lvl];
             Pnt *ptsl = points[lvl];
             for (int i = 0; i < npts; i++) {
-                ptsl[i].iR = 1;
-                ptsl[i].idepth_new = 1;
-                ptsl[i].lastHessian = 0;
+                ptsl[i].iR = 1;          ///< 2. 将i帧上的点对应的期望iR逆深度全部置为1
+                ptsl[i].idepth_new = 1;  ///< 3. 将i帧上的新逆深度置为1
+                ptsl[i].lastHessian = 0; ///< 4. 将i帧上之前计算的hessian置为0，即点的部分去掉先验
             }
         }
     }
 
+    /// 拷贝优化初始值,当金字塔优化层被接受时，更新 refToNew_current
     SE3 refToNew_current = thisToNext;
     AffLight refToNew_aff_current = thisToNext_aff;
 
-    // 如果都有仿射系数, 则估计一个初值
+    /// 如果都存在曝光时间，则根据曝光时间计算出一个初始的仿射参数
     if (firstFrame->ab_exposure > 0 && newFrame->ab_exposure > 0)
-        refToNew_aff_current =
-            AffLight(logf(newFrame->ab_exposure / firstFrame->ab_exposure), 0); // coarse approximation.
+        refToNew_aff_current = AffLight(logf(newFrame->ab_exposure / firstFrame->ab_exposure), 0);
 
     Vec3f latestRes = Vec3f::Zero();
-    // 从顶层开始估计
+
+    /// 从顶层开始估计，一直估计到金字塔的第0层
     for (int lvl = pyrLevelsUsed - 1; lvl >= 0; lvl--) {
 
-        //[ ***step 3*** ] 使用计算过的上一层来初始化下一层
-        // 顶层未初始化到, reset来完成
-        if (lvl < pyrLevelsUsed - 1)
+        if (lvl < pyrLevelsUsed - 1) {
+            /// 针对非顶层部分，使用上一层parent和同层neighbours点来初始化当前层的点逆深度期望iR @see propagateDown
             propagateDown(lvl + 1);
+        }
 
-        Mat88f H, Hsc;
-        Vec8f b, bsc;
-        resetPoints(lvl); // 这里对顶层进行初始化!
-                          //[ ***step 4*** ] 迭代之前计算能量, Hessian等
+        /// 定义 E 对 Tji 、 aji 、 bji 对应的海塞矩阵和雅可比矩阵
+        Mat88f H, Hsc; ///< 没有进行schur和进行schur之后的H矩阵
+        Vec8f b, bsc;  ///< 没有进行schur和进行schur之后的J向量
+
+        resetPoints(lvl); ///< 重置点的 energy 和 idepth_new 作为逆深度优化初值，并进行顶层点的iR更新
+
+        /// 计算当前参数下的海塞矩阵和雅可比矩阵，用来构建H @see calcResAndGS
         Vec3f resOld = calcResAndGS(lvl, H, b, Hsc, bsc, refToNew_current, refToNew_aff_current, false);
-        applyStep(lvl); // 新的能量付给旧的
+
+        /// 详细内容 @see applyStep
+        applyStep(lvl); ///< 这里的作用是将point->energy_new 、point->lastHessian_new 、point->isGood_new 更新,idepth_new没有变化
 
         float lambda = 0.1;
         float eps = 1e-4;
         int fails = 0;
-        // 初始信息
+
+        /// 初始信息
         if (printDebug) {
-            printf("lvl %d, it %d (l=%f) %s: %.3f+%.5f -> %.3f+%.5f (%.3f->%.3f) (|inc| = %f)! \t", lvl, 0, lambda,
-                   "INITIA",
+            printf("lvl %d, it %d (l=%f) %s: %.3f+%.5f -> %.3f+%.5f (%.3f->%.3f) (|inc| = %f)! \t", lvl, 0, lambda, "INITIA",
                    sqrtf((float)(resOld[0] / resOld[2])), // 卡方(res*res)平均值
                    sqrtf((float)(resOld[1] / resOld[2])), // 逆深度能量平均值
-                   sqrtf((float)(resOld[0] / resOld[2])), sqrtf((float)(resOld[1] / resOld[2])),
-                   (resOld[0] + resOld[1]) / resOld[2], (resOld[0] + resOld[1]) / resOld[2], 0.0f);
-            std::cout << refToNew_current.log().transpose() << " AFF " << refToNew_aff_current.vec().transpose()
-                      << "\n";
+                   sqrtf((float)(resOld[0] / resOld[2])), sqrtf((float)(resOld[1] / resOld[2])), (resOld[0] + resOld[1]) / resOld[2],
+                   (resOld[0] + resOld[1]) / resOld[2], 0.0f);
+            std::cout << refToNew_current.log().transpose() << " AFF " << refToNew_aff_current.vec().transpose() << "\n";
         }
 
-        //[ ***step 5*** ] 迭代求解
+        /// 上面使用初值计算除了初始的能量值和与优化对应的H，b，Hsc和bsc
         int iteration = 0;
         while (true) {
-            //[ ***step 5.1*** ] 计算边缘化后的Hessian矩阵, 以及一些骚操作
-            Mat88f Hl = H;
+            Mat88f Hl = H; ///< 保存边缘化后的H矩阵，并考虑LM的影响 Hnew = H[diag] * (1 + lambda)
+
+            /// 对边缘化的U矩阵，LM方法仅作用在了对角线的部分
             for (int i = 0; i < 8; i++)
-                Hl(i, i) *= (1 + lambda); // 这不是LM么,论文说没用, 嘴硬
-            // 舒尔补, 边缘化掉逆深度状态
-            Hl -= Hsc * (1 / (1 + lambda)); // 因为dd必定是对角线上的, 所以也乘倒数
+                Hl(i, i) *= (1 + lambda);
+
+            /// 对需要减去的部分 W V^-1 W^T，针对V ---> V * (1 + lambda)
+            Hl -= Hsc * (1 / (1 + lambda));
             Vec8f bl = b - bsc * (1 / (1 + lambda));
-            //? wM为什么这么乘, 它对应着状态的SCALE
-            //? (0.01f/(w[lvl]*h[lvl]))是为了减小数值, 更稳定?
-            Hl = wM * Hl * wM * (0.01f / (w[lvl] * h[lvl]));
-            bl = wM * bl * (0.01f / (w[lvl] * h[lvl]));
 
-            //[ ***step 5.2*** ] 求解增量
+            /// 这里使用了wM，将这里的H和b矩阵映射到了 x = A x'，映射到了x'上了
+            Hl = wM * Hl * wM * (0.01f / (w[lvl] * h[lvl])); ///< 针对x'的H矩阵
+            bl = wM * bl * (0.01f / (w[lvl] * h[lvl]));      ///< 针对x'的b向量
+
+            ///! 使用边缘化后的Hsc和bsc进行增量计算，但是这里使用wM的方式，貌似没有出现应有的效果，因为后续使用wM系数矩阵又将优化增量部分映射回去了
             Vec8f inc;
-            if (fixAffine) // 固定光度参数
+            if (fixAffine) ///< 考虑了a和b防射参数固定的情况，原理在于固定待优化量，其雅可比为0，索引可以直接将H矩阵中的某几块置0
             {
-                inc.head<6>() =
-                    -(wM.toDenseMatrix().topLeftCorner<6, 6>() * (Hl.topLeftCorner<6, 6>().ldlt().solve(bl.head<6>())));
+                /// 这里使用的是将 6 * 6的部分拿出来了，和置零的情况一致
+                inc.head<6>() = -(wM.toDenseMatrix().topLeftCorner<6, 6>() * (Hl.topLeftCorner<6, 6>().ldlt().solve(bl.head<6>())));
                 inc.tail<2>().setZero();
-            } else
-                inc = -(wM * (Hl.ldlt().solve(bl))); //=-H^-1 * b.
+            } else                                   ///< 考虑了参数非固定的情况
+                inc = -(wM * (Hl.ldlt().solve(bl))); ///< delta_x = -H^-1 * b.
 
-            //[ ***step 5.3*** ] 更新状态, doStep中更新逆深度
+            /// 使用左乘的方式更新Tji
             SE3 refToNew_new = SE3::exp(inc.head<6>().cast<double>()) * refToNew_current;
+
+            /// 更新仿射参数
             AffLight refToNew_aff_new = refToNew_aff_current;
             refToNew_aff_new.a += inc[6];
             refToNew_aff_new.b += inc[7];
+
+            /// 更新点的逆深度
             doStep(lvl, lambda, inc);
 
-            //[ ***step 5.4*** ] 计算更新后的能量并且与旧的对比判断是否accept
             Mat88f H_new, Hsc_new;
             Vec8f b_new, bsc_new;
+
+            /// 使用calcResAndGS的方式计算新的H矩阵，J矩阵和对应的能量值resNew
             Vec3f resNew = calcResAndGS(lvl, H_new, b_new, Hsc_new, bsc_new, refToNew_new, refToNew_aff_new, false);
-            Vec3f regEnergy = calcEC(lvl);
+            Vec3f regEnergy = calcEC(lvl); ///< 计算点正则化对应的能量部分
 
-            float eTotalNew = (resNew[0] + resNew[1] + regEnergy[1]);
-            float eTotalOld = (resOld[0] + resOld[1] + regEnergy[0]);
+            float eTotalNew = (resNew[0] + resNew[1] + regEnergy[1]); ///< 新能量
+            float eTotalOld = (resOld[0] + resOld[1] + regEnergy[0]); ///< 旧能量
 
-            bool accept = eTotalOld > eTotalNew;
+            bool accept = eTotalOld > eTotalNew; ///< 当发生能量减少时，则接受更新
 
             if (printDebug) {
-                printf(
-                    "lvl %d, it %d (l=%f) %s: %.5f + %.5f + %.5f -> %.5f + %.5f + %.5f (%.2f->%.2f) (|inc| = %f)! \t",
-                    lvl, iteration, lambda, (accept ? "ACCEPT" : "REJECT"), sqrtf((float)(resOld[0] / resOld[2])),
-                    sqrtf((float)(regEnergy[0] / regEnergy[2])), sqrtf((float)(resOld[1] / resOld[2])),
-                    sqrtf((float)(resNew[0] / resNew[2])), sqrtf((float)(regEnergy[1] / regEnergy[2])),
-                    sqrtf((float)(resNew[1] / resNew[2])), eTotalOld / resNew[2], eTotalNew / resNew[2], inc.norm());
+                printf("lvl %d, it %d (l=%f) %s: %.5f + %.5f + %.5f -> %.5f + %.5f + %.5f (%.2f->%.2f) (|inc| = %f)! \t", lvl, iteration, lambda,
+                       (accept ? "ACCEPT" : "REJECT"), sqrtf((float)(resOld[0] / resOld[2])), sqrtf((float)(regEnergy[0] / regEnergy[2])),
+                       sqrtf((float)(resOld[1] / resOld[2])), sqrtf((float)(resNew[0] / resNew[2])), sqrtf((float)(regEnergy[1] / regEnergy[2])),
+                       sqrtf((float)(resNew[1] / resNew[2])), eTotalOld / resNew[2], eTotalNew / resNew[2], inc.norm());
                 std::cout << refToNew_new.log().transpose() << " AFF " << refToNew_aff_new.vec().transpose() << "\n";
             }
-            //[ ***step 5.5*** ] 接受的话, 更新状态,; 不接受则增大lambda
+
             if (accept) {
-                //? 这是啥   答：应该是位移足够大，才开始优化IR
+                // 这是t平移足够大时
                 if (resNew[1] == alphaK * numPoints[lvl]) // 当 alphaEnergy > alphaK*npts
                     snapped = true;
                 H = H_new;
@@ -207,27 +238,26 @@ bool CoarseInitializer::trackFrame(FrameHessian *newFrameHessian, std::vector<IO
                 resOld = resNew;
                 refToNew_aff_current = refToNew_aff_new;
                 refToNew_current = refToNew_new;
-                applyStep(lvl);
-                optReg(lvl); // 更新iR
-                lambda *= 0.5;
-                fails = 0;
-                if (lambda < 0.0001)
+                applyStep(lvl);      ///< 交换了点的状态，深度和能量值，以及中间变量JbBuffer
+                optReg(lvl);         ///< 更新iR
+                lambda *= 0.5;       ///< lambda 递减，增大下面的可行域
+                fails = 0;           ///< 连续失败次数置0
+                if (lambda < 0.0001) ///< 要求lambda 最小为0.0001
                     lambda = 0.0001;
             } else {
-                fails++;
-                lambda *= 4;
-                if (lambda > 10000)
+                fails++;            ///< 连续失败次数+1
+                lambda *= 4;        ///< lambda 递增，减小下面更新的可行域
+                if (lambda > 10000) ///< 要求lambda 最大不能超过10000
                     lambda = 10000;
             }
 
             bool quitOpt = false;
-            // 迭代停止条件, 收敛/大于最大次数/失败2次以上
-            if (!(inc.norm() > eps) || iteration >= maxIterations[lvl] || fails >= 2) {
-                Mat88f H, Hsc;
-                Vec8f b, bsc;
 
+            /// 1. deltaX的增量小于eps，代表收敛，优化结束
+            /// 2. iteration大于最大迭代次数，代表优化加速，这里的迭代次数包括没有被接受的迭代‘
+            /// 3. 当被拒绝的次数大于等于2次，代表收敛，优化结束
+            if (!(inc.norm() > eps) || iteration >= maxIterations[lvl] || fails >= 2)
                 quitOpt = true;
-            }
 
             if (quitOpt)
                 break;
@@ -236,23 +266,24 @@ bool CoarseInitializer::trackFrame(FrameHessian *newFrameHessian, std::vector<IO
         latestRes = resOld;
     }
 
-    //[ ***step 6*** ] 优化后赋值位姿, 从底层计算上层点的深度
+    /// 使用金字塔的方式从 粗 到 精 优化后，将优化的Tji，aji和bji进行更新
     thisToNext = refToNew_current;
     thisToNext_aff = refToNew_aff_current;
 
     for (int i = 0; i < pyrLevelsUsed - 1; i++)
-        propagateUp(i);
+        propagateUp(i); ///< 使用下一层的点信息更新上一层的idepth和iR，并且考虑邻居的平滑更新iR
 
+    /// 处理snapped的状态
     frameID++;
     if (!snapped)
-        snappedAt = 0;
+        snappedAt = 0; ///< snappedAt的意义应该为，连续snapped的第一帧id
 
     if (snapped && snappedAt == 0)
-        snappedAt = frameID; // 位移足够的帧数
+        snappedAt = frameID; ///< 位移足够的帧id
 
     debugPlot(0, wraps);
 
-    // 位移足够大, 再优化5帧才行
+    /// 优化的连续5帧，都应该保证tji足够
     return snapped && frameID > snappedAt + 5;
 }
 
@@ -298,259 +329,268 @@ void CoarseInitializer::debugPlot(int lvl, std::vector<IOWrap::Output3DWrapper *
         ow->pushDepthImage(&iRImg);
 }
 
-//* 计算能量函数和Hessian矩阵, 以及舒尔补, sc代表Schur
-// calculates residual, Hessian and Hessian-block neede for re-substituting depth.
-Vec3f CoarseInitializer::calcResAndGS(int lvl, Mat88f &H_out, Vec8f &b_out, Mat88f &H_out_sc, Vec8f &b_out_sc,
-                                      const SE3 &refToNew, AffLight refToNew_aff, bool plot) {
+/**
+ * @brief 计算某个层级lvl上的，H，b，Hsc和bsc，即schur之前和之后的内容
+ *
+ * @param lvl           输入的金字塔层级
+ * @param H_out         输出的H矩阵，仅包含Tji、aji和bji的内容（海塞矩阵）
+ * @param b_out         输出的b向量，仅包含Tji、aji和bji的内容（雅可比矩阵）
+ * @param H_out_sc      输出的Schur分解之后的Hsc矩阵
+ * @param b_out_sc      输出的Schur分解之后的bsc向量
+ * @param refToNew      输入输出的Tji
+ * @param refToNew_aff  输入输出的aji和bji
+ * @param plot          是否绘图
+ * @return Vec3f        [能量，tji的正则项能量，用到的点的数量(rk)]
+ */
+Vec3f CoarseInitializer::calcResAndGS(int lvl, Mat88f &H_out, Vec8f &b_out, Mat88f &H_out_sc, Vec8f &b_out_sc, const SE3 &refToNew,
+                                      AffLight refToNew_aff, bool plot) {
+    /// 获取金字塔层级的宽度和高度
     int wl = w[lvl], hl = h[lvl];
-    // 当前层图像及梯度
+
+    /// 获取i帧和j帧，I,dx,dy...
     Eigen::Vector3f *colorRef = firstFrame->dIp[lvl];
     Eigen::Vector3f *colorNew = newFrame->dIp[lvl];
 
-    //! 旋转矩阵R * 内参矩阵K_inv
-    Mat33f RKi = (refToNew.rotationMatrix() * Ki[lvl]).cast<float>();
-    Vec3f t = refToNew.translation().cast<float>();                                   // 平移
-    Eigen::Vector2f r2new_aff = Eigen::Vector2f(exp(refToNew_aff.a), refToNew_aff.b); // 光度参数
+    /// 获取Rji * K^-1、tji和e^{aji}和bji
+    Mat33f RKi = (refToNew.rotationMatrix() * Ki[lvl]).cast<float>();                 ///< Rji * K_inv
+    Vec3f t = refToNew.translation().cast<float>();                                   ///< tji
+    Eigen::Vector2f r2new_aff = Eigen::Vector2f(exp(refToNew_aff.a), refToNew_aff.b); ///< aji、bji光度仿射参数
 
-    // 该层的相机参数
+    /// 获取该层的相机参数，fxl,fyl,cxl,cyl
     float fxl = fx[lvl];
     float fyl = fy[lvl];
     float cxl = cx[lvl];
     float cyl = cy[lvl];
 
-    Accumulator11 E;   // 1*1 的累加器
-    acc9.initialize(); // 初始值, 分配空间
-    E.initialize();
+    Accumulator11 E;   ///< 定义一个 1*1 的累加器，用于累加能量值部分
+    acc9.initialize(); ///< 初始化acc9，一个9*9的累加器，用来累加计算H和b部分
+    E.initialize();    ///< 初始化E累加器
 
     int npts = numPoints[lvl];
-    Pnt *ptsl = points[lvl];
+    Pnt *ptsl = points[lvl]; ///< i帧上，lvl层的候选点
+
+    /// 遍历参考帧i上的lvl层级上的所有点point
     for (int i = 0; i < npts; i++) {
 
-        Pnt *point = ptsl + i;
+        Pnt *point = ptsl + i; ///< 获取pi->point
+        point->maxstep = 1e10; ///< 初始化点的maxstep
 
-        point->maxstep = 1e10;
-        if (!point->isGood) // 点不好
-        {
-            E.updateSingle((float)(point->energy[0])); // 累加
-            point->energy_new = point->energy;
-            point->isGood_new = false;
+        /// 针对在其他frame优化上，确定为坏点的情况下，设置完energy后，直接跳过这部分的内容计算
+        if (!point->isGood) {
+            /// 将坏点的能量部分，累加到E的累加器中
+            E.updateSingle((float)(point->energy[0]));
+
+            point->energy_new = point->energy; ///< 将energy_new部分拷贝energy的值，作为优化改变的能量值
+            point->isGood_new = false;         ///< 在迭代过程中，判断是否为good，设置为false
             continue;
         }
 
-        VecNRf dp0; // 8*1矩阵, 每个点附近的残差个数为8个
-        VecNRf dp1;
-        VecNRf dp2;
-        VecNRf dp3;
-        VecNRf dp4;
-        VecNRf dp5;
-        VecNRf dp6;
-        VecNRf dp7;
-        VecNRf dd;
-        VecNRf r;
-        JbBuffer_new[i].setZero(); // 10*1 向量
+        /// 这部分用于计算H和b矩阵
+        VecNRf dp0; ///< drk / dx，索引为pattern num
+        VecNRf dp1; ///< drk / dy，索引为pattern num
+        VecNRf dp2; ///< drk / dz，索引为pattern num
+        VecNRf dp3; ///< drk / dphi_x，索引为pattern num
+        VecNRf dp4; ///< drk / dphi_y，索引为pattern num
+        VecNRf dp5; ///< drk / dphi_z，索引为pattern num
+        VecNRf dp6; ///< drk / daji，索引为pattern num
+        VecNRf dp7; ///< drk / dbji，索引为pattern num
+        VecNRf dd;  ///< drk / ddpi，索引为pattern num
+        VecNRf r;   ///< rk，索引为pattern num
 
-        // sum over all residuals.
-        bool isGood = true;
-        float energy = 0;
+        /// 10*1 向量，用来缓存H矩阵和b矩阵的中间缓冲量的
+        JbBuffer_new[i].setZero();
+
+        bool isGood = true; ///< 用来判断point点是否为good
+        float energy = 0;   ///< 用来存储点的能量值
+
+        /// 遍历pi对应的一个pattern，将不同的内容放到dp0、dp1...中
         for (int idx = 0; idx < patternNum; idx++) {
-            // pattern的坐标偏移
+            /// 获取pattern的坐标偏移
             int dx = patternP[idx][0];
             int dy = patternP[idx][1];
 
-            //! Pj' = R*(X/Z, Y/Z, 1) + t/Z, 变换到新的点, 深度仍然使用Host帧的!
+            /// Pj' = Rji * K_inv * (pi + dx, pi + dy, 1) + tji * dpi --> Pj = Pj' / dpi，使用host点的逆深度
             Vec3f pt = RKi * Vec3f(point->u + dx, point->v + dy, 1) + t * point->idepth_new;
-            // 归一化坐标 Pj
+
+            /// 归一化坐标 Pj_norm = (u, v)
             float u = pt[0] / pt[2];
             float v = pt[1] / pt[2];
-            // 像素坐标pj
+
+            /// 像素坐标pj = (Ku, kv)
             float Ku = fxl * u + cxl;
             float Kv = fyl * v + cyl;
-            // dpi/pz'
-            float new_idepth = point->idepth_new / pt[2]; // 新一帧上的逆深度
 
-            // 落在边缘附近，深度小于0, 则不好
+            /// dpi/pz'--> 新一帧上的逆深度，1 / Pjz
+            float new_idepth = point->idepth_new / pt[2];
+
+            /// 判断条件一：若像素点落在边框为2的界内，或者逆深度为负，则认为point为坏点，直接跳出pattern的迭代
             if (!(Ku > 1 && Kv > 1 && Ku < wl - 2 && Kv < hl - 2 && new_idepth > 0)) {
                 isGood = false;
                 break;
             }
-            // 插值得到新图像中的 patch 像素值，(输入3维，输出3维像素值 + x方向梯度 + y方向梯度)
-            Vec3f hitColor = getInterpolatedElement33(colorNew, Ku, Kv, wl);
-            // Vec3f hitColor = getInterpolatedElement33BiCub(colorNew, Ku, Kv, wl);
 
-            // 参考帧上的 patch 上的像素值, 输出一维像素值
-            // float rlR = colorRef[point->u+dx + (point->v+dy) * wl][0];
+            /// 得到j帧上的像素值、x方向梯度和y方向梯度，通过插值的方式得到,patch上的某个点，pj
+            Vec3f hitColor = getInterpolatedElement33(colorNew, Ku, Kv, wl);
+
+            /// 得到i帧上的像素值，同样使用插值的方式获得，patch上的某个点pi对应的像素值
             float rlR = getInterpolatedElement31(colorRef, point->u + dx, point->v + dy, wl);
 
-            // 像素值有穷, good
+            /// 判断条件二：像素值有穷, 要求i帧和j帧上的像素值是有穷的，否则认为是坏点
             if (!std::isfinite(rlR) || !std::isfinite((float)hitColor[0])) {
                 isGood = false;
                 break;
             }
 
-            // 残差
+            // 某个pattern中点的残差，rk = Ij[pj] - a * Ii[pi] - b，k ~ [0, pattern_num]
             float residual = hitColor[0] - r2new_aff[0] * rlR - r2new_aff[1];
-            // Huber权重
-            float hw = fabs(residual) < setting_huberTH ? 1 : setting_huberTH / fabs(residual);
-            // huberweight * (2-huberweight) = Objective Function
-            // robust 权重和函数之间的关系
-            energy += hw * residual * residual * (2 - hw);
 
-            // Pj 对 逆深度 di 求导
-            //! 1/Pz * (tx - u*tz), u = px/pz
-            float dxdd = (t[0] - t[2] * u) / pt[2];
-            //! 1/Pz * (ty - v*tz), u = py/pz
-            float dydd = (t[1] - t[2] * v) / pt[2];
+            // Huber权重，根据残差大小确定huber权重，这里也可以使用huber核函数
+            float hw = fabs(residual) < setting_huberTH ? 1 : setting_huberTH / fabs(residual);
+            energy += hw * residual * residual * (2 - hw); ///< 某个pattern的energy（能量值）
+
+            float dxdd = (t[0] - t[2] * u) / pt[2]; ///< pjx对逆深度求导中间量(tx - tz * xj' / zj') / zj'
+            float dydd = (t[1] - t[2] * v) / pt[2]; ///< pjy对逆深度求导中间量(ty - tz * yj' / zj') / zj'
 
             if (hw < 1)
-                hw = sqrtf(hw); //?? 为啥开根号, 答: 鲁棒核函数等价于加权最小二乘
-            //! dxfx, dyfy
-            float dxInterp = hw * hitColor[1] * fxl;
-            float dyInterp = hw * hitColor[2] * fyl;
-            //* 残差对 j(新状态) 位姿求导,
-            dp0[idx] = new_idepth * dxInterp;                       //! dpi/pz' * dxfx
-            dp1[idx] = new_idepth * dyInterp;                       //! dpi/pz' * dyfy
-            dp2[idx] = -new_idepth * (u * dxInterp + v * dyInterp); //! -dpi/pz' * (px'/pz'*dxfx + py'/pz'*dyfy)
-            dp3[idx] = -u * v * dxInterp - (1 + v * v) * dyInterp;  //! - px'py'/pz'^2*dxfy - (1+py'^2/pz'^2)*dyfy
-            dp4[idx] = (1 + u * u) * dxInterp + u * v * dyInterp;   //! (1+px'^2/pz'^2)*dxfx + px'py'/pz'^2*dxfy
-            dp5[idx] = -v * dxInterp + u * dyInterp;                //! -py'/pz'*dxfx + px'/pz'*dyfy
-            //* 残差对光度参数求导
-            dp6[idx] = -hw * r2new_aff[0] * rlR; //! exp(aj-ai)*I(pi)
-            dp7[idx] = -hw * 1;                  //! 对 b 导
-            //* 残差对 i(旧状态) 逆深度求导
-            dd[idx] = dxInterp * dxdd + dyInterp * dydd; //! dxfx * 1/Pz * (tx - u*tz) +　dyfy * 1/Pz * (tx - u*tz)
-            r[idx] = hw * residual;                      //! 残差 res
+                hw = sqrtf(hw);
 
-            //* 像素误差对逆深度的导数，取模倒数
-            float maxstep = 1.0f / Vec2f(dxdd * fxl, dydd * fyl).norm(); //? 为什么这么设置
+            float dxInterp = hw * hitColor[1] * fxl; ///< fx * dx * hw (带有核函数部分)
+            float dyInterp = hw * hitColor[2] * fyl; ///< fy * dy * hw (带有核函数部分)
+
+            /// 残差对 Tji左扰动 求导,
+            dp0[idx] = new_idepth * dxInterp;                       ///< drk / dx, dpi/pz' * dxfx
+            dp1[idx] = new_idepth * dyInterp;                       ///< drk / dy, dpi/pz' * dyfy
+            dp2[idx] = -new_idepth * (u * dxInterp + v * dyInterp); ///< drk / dz, -dpi/pz' * (px'/pz'*dxfx + py'/pz'*dyfy)
+            dp3[idx] = -u * v * dxInterp - (1 + v * v) * dyInterp;  ///< drk / dphi_x, - px'py'/pz'^2*dxfy - (1+py'^2/pz'^2)*dyfy
+            dp4[idx] = (1 + u * u) * dxInterp + u * v * dyInterp;   ///< drk / dphi_y, (1+px'^2/pz'^2)*dxfx + px'py'/pz'^2*dxfy
+            dp5[idx] = -v * dxInterp + u * dyInterp;                ///< drk / dphi_z,  -py'/pz'*dxfx + px'/pz'*dyfy
+
+            /// 残差对光度参数求导
+            dp6[idx] = -hw * r2new_aff[0] * rlR; ///< rk / aji, exp(aj-ai)*I(pi)
+            dp7[idx] = -hw * 1;                  ///< rk / bji,  对 b 导
+
+            /// 残差对dpi求导
+            dd[idx] = dxInterp * dxdd + dyInterp * dydd; ///< dxfx * 1/Pz * (tx - u*tz) +　dyfy * 1/Pz * (tx - u*tz)
+
+            /// 残差res本身
+            r[idx] = hw * residual; ///< 残差res本身
+
+            /// 以pj对逆深度求导模长的逆作为maxstep，使用maxstep * delta_pj.norm --> delta_dpi，方便使用像素变化来控制逆深度变化
+            /// 后续源码里面使用了0.25个pj像素移动来控制逆深度的更新step，即 0.25 * maxstep作为逆深度更新步长
+            float maxstep = 1.0f / Vec2f(dxdd * fxl, dydd * fyl).norm();
             if (maxstep < point->maxstep)
                 point->maxstep = maxstep;
 
-            // immediately compute dp*dd' and dd*dd' in JbBuffer1.
-            //* 计算Hessian的第一行(列), 及Jr 关于逆深度那一行
-            // 用来计算舒尔补
-            JbBuffer_new[i][0] += dp0[idx] * dd[idx];
-            JbBuffer_new[i][1] += dp1[idx] * dd[idx];
-            JbBuffer_new[i][2] += dp2[idx] * dd[idx];
-            JbBuffer_new[i][3] += dp3[idx] * dd[idx];
-            JbBuffer_new[i][4] += dp4[idx] * dd[idx];
-            JbBuffer_new[i][5] += dp5[idx] * dd[idx];
-            JbBuffer_new[i][6] += dp6[idx] * dd[idx];
-            JbBuffer_new[i][7] += dp7[idx] * dd[idx];
-            JbBuffer_new[i][8] += r[idx] * dd[idx];
-            JbBuffer_new[i][9] += dd[idx] * dd[idx];
+            /// 中间变量的缓冲区，这部分主要是用于计算Hsc和bsc部分的内容
+            JbBuffer_new[i][0] += dp0[idx] * dd[idx]; ///< sum drk / dx * drk / ddpi
+            JbBuffer_new[i][1] += dp1[idx] * dd[idx]; ///< sum drk / dy * drk / ddpi
+            JbBuffer_new[i][2] += dp2[idx] * dd[idx]; ///< sum drk / dz * drk / ddpi
+            JbBuffer_new[i][3] += dp3[idx] * dd[idx]; ///< sum drk / dphi_x * drk / ddpi
+            JbBuffer_new[i][4] += dp4[idx] * dd[idx]; ///< sum drk / dphi_y * drk / ddpi
+            JbBuffer_new[i][5] += dp5[idx] * dd[idx]; ///< sum drk / dphi_z * drk / ddpi
+            JbBuffer_new[i][6] += dp6[idx] * dd[idx]; ///< sum drk / daji * drk / ddpi
+            JbBuffer_new[i][7] += dp7[idx] * dd[idx]; ///< sum drk / dbji * drk / ddpi
+            JbBuffer_new[i][8] += r[idx] * dd[idx];   ///< sum rk * drk / ddpi --> pattern能量对逆深度的雅可比
+            JbBuffer_new[i][9] += dd[idx] * dd[idx];  ///< sum drk / ddpi * drk / ddpi
         }
 
-        // 如果点的pattern(其中一个像素)超出图像,像素值无穷, 或者残差大于阈值
+        /// 如果点的pattern(其中一个像素)超出图像或者像素值无穷, pattern的能量大于阈值
         if (!isGood || energy > point->outlierTH * 20) {
-            E.updateSingle((float)(point->energy[0])); // 上一帧的加进来
-            point->isGood_new = false;
-            point->energy_new = point->energy; //上一次的给当前次的
+            /// 认为这个pi点对应的pattern在这次优化中不会起到作用，将该点之前的energy加到E内
+            E.updateSingle((float)(point->energy[0]));
+
+            point->isGood_new = false;         ///< 将isGood_new这个点设置为外点
+            point->energy_new = point->energy; ///< 将energy_new的内容由之前的energy赋值
             continue;
         }
 
-        // 内点则加进能量函数
-        // add into energy.
-        E.updateSingle(energy);
-        point->isGood_new = true;
-        point->energy_new[0] = energy;
+        /// 如果pattern中的点pi和pj没有发生意外，并且pattern的能量在阈值范围内
+        E.updateSingle(energy);        ///< 将当前状态的点能量累加到E中
+        point->isGood_new = true;      ///< 将点的isGood_new置为true，说明在当前迭代范围内是可用的
+        point->energy_new[0] = energy; ///< 将由能量函数计算的能量部分赋值给energy_new[不带正则项部分]
 
-        //! 因为使用128位相当于每次加4个数, 因此i+=4, 妙啊!
-        // update Hessian matrix.
+        /// 使用drk / dx、drk / dy...，和intel芯片的SIMD的SSE指令集进行加速，计算pattern的Hc和bc
         for (int i = 0; i + 3 < patternNum; i += 4)
-            acc9.updateSSE(_mm_load_ps(((float *)(&dp0)) + i), _mm_load_ps(((float *)(&dp1)) + i),
-                           _mm_load_ps(((float *)(&dp2)) + i), _mm_load_ps(((float *)(&dp3)) + i),
-                           _mm_load_ps(((float *)(&dp4)) + i), _mm_load_ps(((float *)(&dp5)) + i),
-                           _mm_load_ps(((float *)(&dp6)) + i), _mm_load_ps(((float *)(&dp7)) + i),
-                           _mm_load_ps(((float *)(&r)) + i));
+            acc9.updateSSE(_mm_load_ps(((float *)(&dp0)) + i), _mm_load_ps(((float *)(&dp1)) + i), _mm_load_ps(((float *)(&dp2)) + i),
+                           _mm_load_ps(((float *)(&dp3)) + i), _mm_load_ps(((float *)(&dp4)) + i), _mm_load_ps(((float *)(&dp5)) + i),
+                           _mm_load_ps(((float *)(&dp6)) + i), _mm_load_ps(((float *)(&dp7)) + i), _mm_load_ps(((float *)(&r)) + i));
 
-        // 加0, 4, 8后面多余的值, 因为SSE2是以128为单位相加, 多余的单独加
+        /// 当pattern num不是4的倍数时，使用float的形式，单独加进去，用来更新Hc和bc矩阵
         for (int i = ((patternNum >> 2) << 2); i < patternNum; i++)
-            acc9.updateSingle((float)dp0[i], (float)dp1[i], (float)dp2[i], (float)dp3[i], (float)dp4[i], (float)dp5[i],
-                              (float)dp6[i], (float)dp7[i], (float)r[i]);
+            acc9.updateSingle((float)dp0[i], (float)dp1[i], (float)dp2[i], (float)dp3[i], (float)dp4[i], (float)dp5[i], (float)dp6[i], (float)dp7[i],
+                              (float)r[i]);
     }
 
-    E.finish();
-    acc9.finish();
+    E.finish();    ///< 用于汇总，防止大数吃小数
+    acc9.finish(); ///< 用于汇总，防止大数吃小数
 
-    //????? 这是在干吗???
-
-    // calculate alpha energy, and decide if we cap it.
-    Accumulator11 EAlpha;
-    EAlpha.initialize();
     for (int i = 0; i < npts; i++) {
         Pnt *point = ptsl + i;
-        if (!point->isGood_new) // 点不好用之前的
-        {
-            E.updateSingle((float)(point->energy[1])); //! 又是故意这样写的，没用的代码
-        } else {
-            // 最开始初始化都是成1
-            point->energy_new[1] = (point->idepth_new - 1) * (point->idepth_new - 1); //? 什么原理?
-            E.updateSingle((float)(point->energy_new[1]));
+        if (point->isGood_new) {
+            /// 点的能量正则化的部分，在平移不足够的情况下，制定一个monocular的尺度，在优化的前提下，向1移动
+            point->energy_new[1] = (point->idepth_new - 1) * (point->idepth_new - 1);
         }
     }
-    EAlpha.finish(); //! 只是计算位移是否足够大
-    float alphaEnergy =
-        alphaW * (EAlpha.A + refToNew.translation().squaredNorm() * npts); // 平移越大, 越容易初始化成功?
 
-    // printf("AE = %f * %f + %f\n", alphaW, EAlpha.A, refToNew.translation().squaredNorm() * npts);
+    /// 平移部分的正则化项，用于判断后续是否已经达到足够的 tji 平移尺寸
+    float alphaEnergy = alphaW * (refToNew.translation().squaredNorm() * npts);
 
-    // compute alpha opt.
-    float alphaOpt;
-    if (alphaEnergy > alphaK * npts) // 平移大于一定值
-    {
+    float alphaOpt; ///< alphaOpt用来判断是否达到了足够的tji平移尺寸
+    if (alphaEnergy > alphaK * npts) {
+        /// 如果tji达到一定尺寸后，将alphaOpt置为0，并且alphaEnergy置为一个常量
         alphaOpt = 0;
         alphaEnergy = alphaK * npts;
     } else {
+        /// 如果tji没有达到要求，则将alphaOpt置为alphaW
         alphaOpt = alphaW;
     }
 
+    /// schur部分的协方差矩阵计算 W(V^{-1})W^T
     acc9SC.initialize();
     for (int i = 0; i < npts; i++) {
         Pnt *point = ptsl + i;
         if (!point->isGood_new)
             continue;
 
-        point->lastHessian_new = JbBuffer_new[i][9]; // 对逆深度 dd*dd
+        point->lastHessian_new = JbBuffer_new[i][9]; ///< i点的海瑟矩阵，赋值，这部分的Hdp不带正则化项的部分
 
-        //? 这又是啥??? 对逆深度的值进行加权? 深度值归一化?
-        // 前面Energe加上了（d-1)*(d-1), 所以dd = 1， r += (d-1)
-        JbBuffer_new[i][8] += alphaOpt * (point->idepth_new - 1); // r*dd
-        JbBuffer_new[i][9] += alphaOpt;                           // 对逆深度导数为1 // dd*dd
+        /// 当平移不够大时，针对不同的点对应的雅可比和海塞矩阵，加上dpi的正则化部分，当平移足够大时，alphaOpt置为0
+        JbBuffer_new[i][8] += alphaOpt * (point->idepth_new - 1); // E'(逆深度正则化)对dpi的雅可比部分
+        JbBuffer_new[i][9] += alphaOpt;                           // E'(逆深度正则化)对dpi的海塞矩阵部分
 
+        /// 当平移足够大时，变更E'正则化能量函数，并对变更后的雅可比和海塞矩阵加上变更项
         if (alphaOpt == 0) {
             JbBuffer_new[i][8] += couplingWeight * (point->idepth_new - point->iR);
             JbBuffer_new[i][9] += couplingWeight;
         }
 
-        JbBuffer_new[i][9] = 1 / (1 + JbBuffer_new[i][9]); // 取逆是协方差，做权重
-        //* 9做权重, 计算的是舒尔补项!
-        //! dp*dd*(dd^2)^-1*dd*dp
-        acc9SC.updateSingleWeighted((float)JbBuffer_new[i][0], (float)JbBuffer_new[i][1], (float)JbBuffer_new[i][2],
-                                    (float)JbBuffer_new[i][3], (float)JbBuffer_new[i][4], (float)JbBuffer_new[i][5],
-                                    (float)JbBuffer_new[i][6], (float)JbBuffer_new[i][7], (float)JbBuffer_new[i][8],
-                                    (float)JbBuffer_new[i][9]);
+        /// 这里为了防止除0操作，加上了1来取能量对dpi的海瑟矩阵的逆，V的逆
+        JbBuffer_new[i][9] = 1 / (1 + JbBuffer_new[i][9]);
+
+        /// 计算Hsc和bsc，使用的是JbBuffer里面的内容
+        acc9SC.updateSingleWeighted((float)JbBuffer_new[i][0], (float)JbBuffer_new[i][1], (float)JbBuffer_new[i][2], (float)JbBuffer_new[i][3],
+                                    (float)JbBuffer_new[i][4], (float)JbBuffer_new[i][5], (float)JbBuffer_new[i][6], (float)JbBuffer_new[i][7],
+                                    (float)JbBuffer_new[i][8], (float)JbBuffer_new[i][9]);
     }
     acc9SC.finish();
 
-    // printf("nelements in H: %d, in E: %d, in Hsc: %d / 9!\n", (int)acc9.num, (int)E.num, (int)acc9SC.num*9);
-    H_out = acc9.H.topLeftCorner<8, 8>();       // / acc9.num;  		!dp^T*dp
-    b_out = acc9.H.topRightCorner<8, 1>();      // / acc9.num; 		!dp^T*r
-    H_out_sc = acc9SC.H.topLeftCorner<8, 8>();  // / acc9.num; 	!(dp*dd)^T*(dd*dd)^-1*(dd*dp)
-    b_out_sc = acc9SC.H.topRightCorner<8, 1>(); // / acc9.num;	!(dp*dd)^T*(dd*dd)^-1*(dp^T*r)
+    H_out = acc9.H.topLeftCorner<8, 8>();       ///< H，并没有添加点的正则化部分，但是并没有关系，因为点的正则化不会改变H矩阵（非点部分）
+    b_out = acc9.H.topRightCorner<8, 1>();      ///< b，并没有添加点的正则化部分，但是并没有关系，因为点的正则化不会改变b向量（非点部分）
+    H_out_sc = acc9SC.H.topLeftCorner<8, 8>();  ///< Hsc，具有点的正则化部分内容，必须要有，因为Hsc的计算需要V
+    b_out_sc = acc9SC.H.topRightCorner<8, 1>(); ///< bsc，具有点的正则化部分内容，必须要有，因为Hsc的计算需要V
 
-    //??? 啥意思
-    // t*t*ntps
-    // 给 t 对应的Hessian, 对角线加上一个数, b也加上
+    ///< 当平移不足时，需要将涉及平移部分的正则化E'的H加到H中
     H_out(0, 0) += alphaOpt * npts;
     H_out(1, 1) += alphaOpt * npts;
     H_out(2, 2) += alphaOpt * npts;
 
+    ///< 当平移不足时，需要将平移部分的正则化E'的J加到b中
     Vec3f tlog = refToNew.log().head<3>().cast<float>(); // 李代数, 平移部分 (上一次的位姿值)
     b_out[0] += tlog[0] * alphaOpt * npts;
     b_out[1] += tlog[1] * alphaOpt * npts;
     b_out[2] += tlog[2] * alphaOpt * npts;
 
-    // 能量值, ? , 使用的点的个数
+    // 能量值, 平移部分的正则化项（当位移不足时，与tji有关，当位移足够时，为一个常数） , 使用的点的个数
     return Vec3f(E.A, alphaEnergy, E.num);
 }
 
@@ -575,11 +615,18 @@ float CoarseInitializer::rescale() {
     return factor;
 }
 
-//* 计算旧的和新的逆深度与iR的差值, 返回旧的差, 新的差, 数目
-//? iR到底是啥呢     答：IR是逆深度的均值，尺度收敛到IR
+/**
+ * @brief 计算tji满足要求时，点的正则化能量部分
+ *
+ * @param lvl       输入的计算的金字塔层级
+ * @return Vec3f    能量值，[E_old, E_new, n]
+ */
 Vec3f CoarseInitializer::calcEC(int lvl) {
+
+    /// 如果tji不满足要求，则直接返回[0, 0, n]
     if (!snapped)
         return Vec3f(0, 0, numPoints[lvl]);
+
     AccumulatorX<2> E;
     E.initialize();
     int npts = numPoints[lvl];
@@ -590,21 +637,28 @@ Vec3f CoarseInitializer::calcEC(int lvl) {
         float rOld = (point->idepth - point->iR);
         float rNew = (point->idepth_new - point->iR);
         E.updateNoWeight(Vec2f(rOld * rOld, rNew * rNew)); // 求和
-
-        // printf("%f %f %f!\n", point->idepth, point->idepth_new, point->iR);
     }
     E.finish();
 
-    // printf("ER: %f %f %f!\n", couplingWeight*E.A1m[0], couplingWeight*E.A1m[1], (float)E.num.numIn1m);
+    /// 如果tji满足要求，则将点的正则化部分对应的能量进行返回[E_old, E_new, n]
     return Vec3f(couplingWeight * E.A1m[0], couplingWeight * E.A1m[1], E.num);
 }
 
-//* 使用最近点来更新每个点的iR, smooth的感觉
+/**
+ * @brief 使用邻近点加权平均的方式，更新点的期望状态
+ * @details
+ *  1. 遍历lvl层上的点pt
+ *  2. 拿到pt的邻近点，且在优化过程中被认为是good的点 neiGoodPts
+ *  3. 对neiGoodPts，求其期望深度iR的中位数 iRMedian
+ *  4. 将pt的逆深度 dp 和中位数进行加权平均 newIR = (1 - weight) * dp + weight * iRMedian
+ *  5. 将newIR更新到pt的iR上
+ * @param lvl 输入的金字塔层级
+ */
 void CoarseInitializer::optReg(int lvl) {
     int npts = numPoints[lvl];
     Pnt *ptsl = points[lvl];
 
-    //* 位移不足够则设置iR是1
+    /// 位移不足够则设置iR是1
     if (!snapped) {
         for (int i = 0; i < npts; i++)
             ptsl[i].iR = 1;
@@ -640,74 +694,89 @@ void CoarseInitializer::optReg(int lvl) {
 //* 使用归一化积来更新高层逆深度值
 void CoarseInitializer::propagateUp(int srcLvl) {
     assert(srcLvl + 1 < pyrLevelsUsed);
-    // set idepth of target
 
-    int nptss = numPoints[srcLvl];
-    int nptst = numPoints[srcLvl + 1];
+    int nptss = numPoints[srcLvl];     ///< 当前层点数目
+    int nptst = numPoints[srcLvl + 1]; ///< 上一层点数目
     Pnt *ptss = points[srcLvl];
     Pnt *ptst = points[srcLvl + 1];
 
-    // set to zero.
+    // 遍历上一层的点，将点的iR和iRSumNum置0
     for (int i = 0; i < nptst; i++) {
         Pnt *parent = ptst + i;
         parent->iR = 0;
         parent->iRSumNum = 0;
     }
-    //* 更新在上一层的parent
+
+    /// 遍历当前层的点
     for (int i = 0; i < nptss; i++) {
         Pnt *point = ptss + i;
         if (!point->isGood)
             continue;
 
         Pnt *parent = ptst + point->parent;
-        parent->iR += point->iR * point->lastHessian; //! 均值*信息矩阵 ∑ (sigma*u)
-        parent->iRSumNum += point->lastHessian;       //! 新的信息矩阵 ∑ sigma
+        parent->iR += point->iR * point->lastHessian; /// 归一化积的 期望iR更新部分
+        parent->iRSumNum += point->lastHessian;       /// 归一化积的 信息矩阵更新部分
     }
 
+    /// 遍历上一层的点parent，使用高斯归一化积更新逆深度idepth、iR，并将点置为good
     for (int i = 0; i < nptst; i++) {
         Pnt *parent = ptst + i;
         if (parent->iRSumNum > 0) {
-            parent->idepth = parent->iR = (parent->iR / parent->iRSumNum); //! 高斯归一化积后的均值
+            parent->idepth = parent->iR = (parent->iR / parent->iRSumNum);
             parent->isGood = true;
         }
     }
 
-    optReg(srcLvl + 1); // 使用附近的点来更新IR和逆深度
+    optReg(srcLvl + 1); ///< 对于期望部分，还需要考虑邻居之间的平滑关系
 }
 
-//@ 使用上层信息来初始化下层
-//@ param: 当前的金字塔层+1
-//@ note: 没法初始化顶层值
+/**
+ * @brief 使用上一层srcLvl的金字塔的点期望来初始化当前层srcLvl - 1的点期望
+ * @details
+ *  1. 遍历当前层的点point，找到point的上层点parent
+ *  2. 如果parent是坏点，‘或者’ parent的lastHessian 小于0.1，则放弃point点的期望iR的更新
+ *  3. 如果point点是坏点，但parent点满足2中的要求，则认为当前point为之前的优化偏差
+ *      3.1 将point的isGood置为true
+ *      3.2 将point的iR、idepth和idepth_new都置为parent的期望iR
+ *      3.3 将point的对应的lastHessian置为0，放弃之前优化的先验，因为认定之前point点的优化是错误的
+ *  4. 如果point点是good点
+ *      4.1 假设 point 的 iR ~ N(point.iR, (point.lastHessian * 2)^-1)
+ *      4.2 假设 parent的 iR ~ N(parent.iR, (parent.lastHessian)^-1)))
+ *      4.3 使用高斯归一化积的形式，进行更新后的iR求解
+ *  5. 在考虑到point点的parent点后，还需要考虑neighbors的平滑关系，使用optReg的方式，对iR进行再一次的更新 @see optReg
+ * @param srcLvl 待初始化点状态的金字塔层级的上一层
+ */
 void CoarseInitializer::propagateDown(int srcLvl) {
     assert(srcLvl > 0);
     // set idepth of target
 
-    int nptst = numPoints[srcLvl - 1]; // 当前层的点数目
-    Pnt *ptss = points[srcLvl];        // 当前层+1, 上一层的点集
-    Pnt *ptst = points[srcLvl - 1];    // 当前层点集
+    int nptst = numPoints[srcLvl - 1]; ///< 当前层的点数目
+    Pnt *ptss = points[srcLvl];        ///< 上一层的点集
+    Pnt *ptst = points[srcLvl - 1];    ///< 当前层点集
 
     for (int i = 0; i < nptst; i++) {
-        Pnt *point = ptst + i;              // 遍历当前层的点
-        Pnt *parent = ptss + point->parent; // 找到当前点的parrent
+        Pnt *point = ptst + i;              ///< 遍历当前层的点
+        Pnt *parent = ptss + point->parent; ///< 找到当前点的 parent 点（在上一层）
 
-        if (!parent->isGood || parent->lastHessian < 0.1)
+        /// 在最小二乘优化中，海塞矩阵可以代表参数的信息矩阵，也就是说海塞矩阵越大，待优化的参数越稳定
+        if (!parent->isGood || parent->lastHessian < 0.1) ///< parent 点非 good ，或者海塞矩阵小于0.1，则认为点的状态不可信
             continue;
+
         if (!point->isGood) {
-            // 当前点不好, 则把父点的值直接给它, 并且置位good
+            /// 这里的point一直是i帧的pi，因此时来一个j帧就会估计一次pi，当父点可信时，即便之前估计的点为not good ，这里也会继续尝试
             point->iR = point->idepth = point->idepth_new = parent->iR;
             point->isGood = true;
             point->lastHessian = 0;
         } else {
             // 通过hessian给point和parent加权求得新的iR
             // iR可以看做是深度的值, 使用的高斯归一化积, Hessian是信息矩阵
-            float newiR = (point->iR * point->lastHessian * 2 + parent->iR * parent->lastHessian) /
-                          (point->lastHessian * 2 + parent->lastHessian);
+            float newiR = (point->iR * point->lastHessian * 2 + parent->iR * parent->lastHessian) / (point->lastHessian * 2 + parent->lastHessian);
             point->iR = point->idepth = point->idepth_new = newiR;
         }
     }
-    //? 为什么在这里又更新了iR, 没有更新 idepth
-    // 感觉更多的是考虑附近点的平滑效果
-    optReg(srcLvl - 1); // 当前层
+
+    /// 使用归一化积更新iR之后，会考虑邻近点之间的连续性，使用邻近点的iR再次进行iR的更新
+    optReg(srcLvl - 1);
 }
 
 //* 低层计算高层, 像素值和梯度
@@ -721,9 +790,8 @@ void CoarseInitializer::makeGradients(Eigen::Vector3f **data) {
         // 使用上一层得到当前层的值
         for (int y = 0; y < hl; y++)
             for (int x = 0; x < wl; x++)
-                dINew_l[x + y * wl][0] =
-                    0.25f * (dINew_lm[2 * x + 2 * y * wlm1][0] + dINew_lm[2 * x + 1 + 2 * y * wlm1][0] +
-                             dINew_lm[2 * x + 2 * y * wlm1 + wlm1][0] + dINew_lm[2 * x + 1 + 2 * y * wlm1 + wlm1][0]);
+                dINew_l[x + y * wl][0] = 0.25f * (dINew_lm[2 * x + 2 * y * wlm1][0] + dINew_lm[2 * x + 1 + 2 * y * wlm1][0] +
+                                                  dINew_lm[2 * x + 2 * y * wlm1 + wlm1][0] + dINew_lm[2 * x + 1 + 2 * y * wlm1 + wlm1][0]);
         // 根据像素计算梯度
         for (int idx = wl; idx < wl * (hl - 1); idx++) {
             dINew_l[idx][1] = 0.5f * (dINew_l[idx + 1][0] - dINew_l[idx - 1][0]);
@@ -828,18 +896,26 @@ void CoarseInitializer::setFirst(CalibHessian *HCalib, FrameHessian *newFrameHes
         dGrads[i].setZero(); //! what is dGrads;
 }
 
-//@ 重置点的energy, idepth_new参数
+/**
+ * @brief 对lvl层级上的点，进行energy、idepth_new的重置
+ * @details
+ *  1. 遍历lvl层级上的点pts
+ *  2. 将pts[i]的能量部分置空，并将当前点的idepth设置为待优化的初始值idepth_new
+ *  3. 在非顶层上，使用 @see propagateDown 函数来更新 iR，而在顶层部分，使用的是顶层上的邻近点平均值作为期望iR（这里同样可以使用中位数代替）
+ * @param lvl 输入的重置的点的金字塔层级
+ */
 void CoarseInitializer::resetPoints(int lvl) {
     Pnt *pts = points[lvl];
     int npts = numPoints[lvl];
     for (int i = 0; i < npts; i++) {
-        // 重置
-        pts[i].energy.setZero();
-        pts[i].idepth_new = pts[i].idepth;
+        pts[i].energy.setZero();           ///< 将点的能量重置为0，分别为残差平方项和正则化项两部分的内容
+        pts[i].idepth_new = pts[i].idepth; ///< 以idepth_new作为优化初始值，拷贝优化之后的逆深度
 
-        // 如果是最顶层, 则使用周围点平均值来重置
+        /// 如果是最顶层, 且点为非good点
         if (lvl == pyrLevelsUsed - 1 && !pts[i].isGood) {
             float snd = 0, sn = 0;
+
+            /// 统计距离pts最近的neighours点，且为good点
             for (int n = 0; n < 10; n++) {
                 if (pts[i].neighbours[n] == -1 || !pts[pts[i].neighbours[n]].isGood)
                     continue;
@@ -847,6 +923,7 @@ void CoarseInitializer::resetPoints(int lvl) {
                 sn += 1;
             }
 
+            /// 将统计的结果的期望平均值赋值给pts
             if (sn > 0) {
                 pts[i].isGood = true;
                 pts[i].iR = pts[i].idepth = pts[i].idepth_new = snd / sn;
@@ -855,24 +932,39 @@ void CoarseInitializer::resetPoints(int lvl) {
     }
 }
 
-//* 求出状态增量后, 计算被边缘化掉的逆深度, 更新逆深度
+/**
+ * @brief 更新点的逆深度，使用pj像素限制方式
+ * @details
+ *  1. 由于V * (1 + lambda) 矩阵为一个主对角线矩阵，因此可以遍历每个点进行计算增量
+ *  2. 跳过那些在计算中被认定为外点的pattern点
+ *  3. 使用inc和b + W[i]^T * inc，来更新b
+ *  4. 使用maxPixelStep来计算逆深度更新的最大步长maxstep
+ *  5. 将step 更新到 点的逆深度中
+ *  6. 并要求点的逆深度在(1e-3, 50)，即深度在(0.02m, 1000m)范围内
+ * @param lvl       待更新逆深度的金字塔层级
+ * @param lambda    LM方法的lambda参数，用来计算LM方法的V矩阵 V * (1 + lambda)
+ * @param inc       Tji，aji和bji的更新量，用来简化计算
+ */
 void CoarseInitializer::doStep(int lvl, float lambda, Vec8f inc) {
 
     const float maxPixelStep = 0.25;
     const float idMaxStep = 1e10;
     Pnt *pts = points[lvl];
     int npts = numPoints[lvl];
+
+    /// 逆深度对应的H矩阵为稀疏矩阵，因此可以一个一个点进行逆深度的求解
     for (int i = 0; i < npts; i++) {
+
+        /// 跳过那些非good的点
         if (!pts[i].isGood)
             continue;
 
-        //! dd*r + (dp*dd)^T*delta_p
+        /// 将逆深度对应的-b和位姿部分的-bp + W[i]^T * delta_xc
         float b = JbBuffer[i][8] + JbBuffer[i].head<8>().dot(inc);
-        //! dd * delta_d = dd*r - (dp*dd)^T*delta_p = b
-        //! delta_d = b * dd^-1
-        float step = -b * JbBuffer[i][9] / (1 + lambda);
+        float step = -b * JbBuffer[i][9] / (1 + lambda); ///< 求出每个点对应的逆深度增量
 
-        float maxstep = maxPixelStep * pts[i].maxstep; // 逆深度最大只能增加这些
+        /// 使用0.25的像素步长限制逆深度的更新幅度，使得逆深度的更新反映在pj上不会移动0.25个像素
+        float maxstep = maxPixelStep * pts[i].maxstep;
         if (maxstep > idMaxStep)
             maxstep = idMaxStep;
 
@@ -881,7 +973,7 @@ void CoarseInitializer::doStep(int lvl, float lambda, Vec8f inc) {
         if (step < -maxstep)
             step = -maxstep;
 
-        // 更新得到新的逆深度
+        /// 更新得到新的逆深度，要求新的逆深度在(1e-3, 50)的内 --> 深度在(0.02m, 1000m)范围内
         float newIdepth = pts[i].idepth + step;
         if (newIdepth < 1e-3)
             newIdepth = 1e-3;
@@ -891,7 +983,12 @@ void CoarseInitializer::doStep(int lvl, float lambda, Vec8f inc) {
     }
 }
 
-//* 新的值赋值给旧的 (能量, 点状态, 逆深度, hessian)
+/**
+ * @brief 对某lvl层金字塔上的点进行更新
+ * @details
+ *  1. 针对之前迭代放弃的点，将其idepth、idepth_new和iR
+ * @param lvl 金字塔层级
+ */
 void CoarseInitializer::applyStep(int lvl) {
     Pnt *pts = points[lvl];
     int npts = numPoints[lvl];
