@@ -174,11 +174,11 @@ void PixelSelector::makeHists(const FrameHessian *const fh) {
  *  3. 其次使用select函数，根据给定的idealPotential进行点的选择 @see PixelSelector::select
  *  4. 计算want / have的比例，判断是否在0.25到1.25区间范围内
  *      4.1 若小于0.25，则代表目前得到的梯度较大点太多了，需要增大idealPotential，若recursionsLeft > 0 递归调用makeMaps
- *      4.2 若大于1.255，则代表目前得到的梯度较大的点太少了，需要减小idealPotential，若recursionsLeft > 0
- * 递归调用makeMaps 4.3 若比例在0.25到1.25之间，则代表目前得到的梯度较大点数目比较合适，不会进行递归了
+ *      4.2 若大于1.255，则代表目前得到的梯度较大的点太少了，需要减小idealPotential，若recursionsLeft > 0 递归调用makeMaps 
+ *      4.3 若比例在0.25到1.25之间，则代表目前得到的梯度较大点数目比较合适，不会进行递归了
  *  5. 判断若比例在[0.95, 1.25]之间，说明点的数量正合适，返回得到的点的数目
  *  6. 若比例在[0.25, 0.95)之间，需要随机删除点，直到比例控制在1左右
- *  7. 最后，将结果
+ *  7. 最后，将结果绘制出来即可
  * @param fh 				输入的FrameHessian数据
  * @param map_out 			选出的地图点
  * @param density 			金字塔层的密度

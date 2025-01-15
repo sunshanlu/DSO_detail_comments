@@ -893,7 +893,7 @@ void CoarseInitializer::setFirst(CalibHessian *HCalib, FrameHessian *newFrameHes
     snappedAt = 0;      ///< 在第几帧进行收敛
 
     for (int i = 0; i < pyrLevelsUsed; i++)
-        dGrads[i].setZero(); //! what is dGrads;
+        dGrads[i].setZero(); //! what is dGrads，好像没有使用
 }
 
 /**
@@ -1026,6 +1026,7 @@ void CoarseInitializer::makeK(CalibHessian *HCalib) {
     fy[0] = HCalib->fyl();
     cx[0] = HCalib->cxl();
     cy[0] = HCalib->cyl();
+    
     /// 求各层的K参数
     for (int level = 1; level < pyrLevelsUsed; ++level) {
         /// 使用>>右移运算符，可以舍去0.5的部分

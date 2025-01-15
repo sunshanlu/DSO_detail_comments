@@ -331,7 +331,6 @@ void parseArgument(char *arg) {
 }
 
 int main(int argc, char **argv) {
-    // setlocale(LC_ALL, "");
     /// 处理命令行参数的部分逻辑，即若有参数输入，则会修改默认配置内容
     for (int i = 1; i < argc; i++)
         parseArgument(argv[i]);
@@ -339,13 +338,13 @@ int main(int argc, char **argv) {
     // 用于处理ctl+c信号，使用了C语言中的sigaction结构体实现
     boost::thread exThread = boost::thread(exitThread);
 
-    // 构造reader用到的参数默认值都是""，可以通过parseArgument函数传递内容
+    /// 构造reader用到的参数默认值都是""，可以通过parseArgument函数传递内容（image_path, K, G_inv, V_inv, timestamps, expoures）
     ImageFolderReader *reader = new ImageFolderReader(source, calib, gammaCalib, vignette);
 
-    // 计算金字塔每层的w、h、K、K_inv
+    /// 计算金字塔每层的w、h、K、K_inv...
     reader->setGlobalCalibration();
 
-    /// 判断光度标定模型和给定的setting配置是否有问题，如果要求有光度模型，但是并没有Gamma函数，则error
+    /// ...,判断是否有矛盾
     if (setting_photometricCalibration > 0 && reader->getPhotometricGamma() == 0) {
         printf("ERROR: dont't have photometric calibation. Need to use commandline options mode=1 or mode=2 ");
         exit(1);
@@ -365,7 +364,7 @@ int main(int argc, char **argv) {
     }
 
     FullSystem *fullSystem = new FullSystem();
-    fullSystem->setGammaFunction(reader->getPhotometricGamma());
+    fullSystem->setGammaFunction(reader->getPhotometricGamma()); ///< 将G 和 G_inv都放到了 HCalib里面
     fullSystem->linearizeOperation = (playbackSpeed == 0);
 
     IOWrap::PangolinDSOViewer *viewer = 0;
@@ -377,7 +376,6 @@ int main(int argc, char **argv) {
     if (useSampleOutput)
         fullSystem->outputWrapper.push_back(new IOWrap::SampleOutputWrapper());
 
-    // to make MacOS happy: run this in dedicated thread -- and use this one to run the GUI.
     std::thread runthread([&]() {
         /// 下面的操作是将idsToPlay和timesToPlayAt进行填充
         std::vector<int> idsToPlay;
@@ -423,8 +421,8 @@ int main(int argc, char **argv) {
             ImageAndExposure *img;
             if (preload)
                 img = preloadedImages[ii];
-            else{
-                /// 这里的reader的getImage函数会对原始图像进行光度矫正，并保存曝光时间和时间戳，其余不管
+            else {
+                /// 仅pinhole 并完成了光度矫正
                 img = reader->getImage(i);
             }
 
@@ -434,8 +432,8 @@ int main(int argc, char **argv) {
             if (playbackSpeed != 0) {
                 struct timeval tv_now;
                 gettimeofday(&tv_now, NULL);
-                double sSinceStart = sInitializerOffset + ((tv_now.tv_sec - tv_start.tv_sec) +
-                                                           (tv_now.tv_usec - tv_start.tv_usec) / (1000.0f * 1000.0f));
+                double sSinceStart =
+                    sInitializerOffset + ((tv_now.tv_sec - tv_start.tv_sec) + (tv_now.tv_usec - tv_start.tv_usec) / (1000.0f * 1000.0f));
 
                 if (sSinceStart < timesToPlayAt[ii])
                     usleep((int)((timesToPlayAt[ii] - sSinceStart) * 1000 * 1000));
@@ -446,7 +444,7 @@ int main(int argc, char **argv) {
             }
 
             if (!skipFrame)
-                fullSystem->addActiveFrame(img, i);
+                fullSystem->addActiveFrame(img, i); ///< 系统处理img帧
 
             delete img;
             /// 系统重置的两种情况：
@@ -491,8 +489,8 @@ int main(int argc, char **argv) {
         int numFramesProcessed = abs(idsToPlay[0] - idsToPlay.back());
         double numSecondsProcessed = fabs(reader->getTimestamp(idsToPlay[0]) - reader->getTimestamp(idsToPlay.back()));
         double MilliSecondsTakenSingle = 1000.0f * (ended - started) / (float)(CLOCKS_PER_SEC);
-        double MilliSecondsTakenMT = sInitializerOffset + ((tv_end.tv_sec - tv_start.tv_sec) * 1000.0f +
-                                                           (tv_end.tv_usec - tv_start.tv_usec) / 1000.0f);
+        double MilliSecondsTakenMT =
+            sInitializerOffset + ((tv_end.tv_sec - tv_start.tv_sec) * 1000.0f + (tv_end.tv_usec - tv_start.tv_usec) / 1000.0f);
         printf("\n======================"
                "\n%d Frames (%.1f fps)"
                "\n%.2fms per frame (single core); "
@@ -500,17 +498,15 @@ int main(int argc, char **argv) {
                "\n%.3fx (single core); "
                "\n%.3fx (multi core); "
                "\n======================\n\n",
-               numFramesProcessed, numFramesProcessed / numSecondsProcessed,
-               MilliSecondsTakenSingle / numFramesProcessed, MilliSecondsTakenMT / (float)numFramesProcessed,
-               1000 / (MilliSecondsTakenSingle / numSecondsProcessed),
+               numFramesProcessed, numFramesProcessed / numSecondsProcessed, MilliSecondsTakenSingle / numFramesProcessed,
+               MilliSecondsTakenMT / (float)numFramesProcessed, 1000 / (MilliSecondsTakenSingle / numSecondsProcessed),
                1000 / (MilliSecondsTakenMT / numSecondsProcessed));
         // fullSystem->printFrameLifetimes();
         if (setting_logStuff) {
             std::ofstream tmlog;
             tmlog.open("logs/time.txt", std::ios::trunc | std::ios::out);
             tmlog << 1000.0f * (ended - started) / (float)(CLOCKS_PER_SEC * reader->getNumImages()) << " "
-                  << ((tv_end.tv_sec - tv_start.tv_sec) * 1000.0f + (tv_end.tv_usec - tv_start.tv_usec) / 1000.0f) /
-                         (float)reader->getNumImages()
+                  << ((tv_end.tv_sec - tv_start.tv_sec) * 1000.0f + (tv_end.tv_usec - tv_start.tv_usec) / 1000.0f) / (float)reader->getNumImages()
                   << "\n";
             tmlog.flush();
             tmlog.close();

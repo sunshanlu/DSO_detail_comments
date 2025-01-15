@@ -1,568 +1,541 @@
 /**
-* This file is part of DSO.
-* 
-* Copyright 2016 Technical University of Munich and Intel.
-* Developed by Jakob Engel <engelj at in dot tum dot de>,
-* for more information see <http://vision.in.tum.de/dso>.
-* If you use this code, please cite the respective publications as
-* listed on the above website.
-*
-* DSO is free software: you can redistribute it and/or modify
-* it under the terms of the GNU General Public License as published by
-* the Free Software Foundation, either version 3 of the License, or
-* (at your option) any later version.
-*
-* DSO is distributed in the hope that it will be useful,
-* but WITHOUT ANY WARRANTY; without even the implied warranty of
-* MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
-* GNU General Public License for more details.
-*
-* You should have received a copy of the GNU General Public License
-* along with DSO. If not, see <http://www.gnu.org/licenses/>.
-*/
-
-
+ * This file is part of DSO.
+ *
+ * Copyright 2016 Technical University of Munich and Intel.
+ * Developed by Jakob Engel <engelj at in dot tum dot de>,
+ * for more information see <http://vision.in.tum.de/dso>.
+ * If you use this code, please cite the respective publications as
+ * listed on the above website.
+ *
+ * DSO is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * DSO is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with DSO. If not, see <http://www.gnu.org/licenses/>.
+ */
 
 #include "FullSystem/ImmaturePoint.h"
-#include "util/FrameShell.h"
 #include "FullSystem/ResidualProjections.h"
+#include "util/FrameShell.h"
 
-namespace dso
-{
-//! 这里u_ v_ 是加了0.5的
-ImmaturePoint::ImmaturePoint(int u_, int v_, FrameHessian* host_, float type, CalibHessian* HCalib)
-: u(u_), v(v_), host(host_), my_type(type), idepth_min(0), idepth_max(NAN), lastTraceStatus(IPS_UNINITIALIZED)
-{
+namespace dso {
 
-	gradH.setZero();
+ImmaturePoint::ImmaturePoint(int u_, int v_, FrameHessian *host_, float type, CalibHessian *HCalib)
+    : u(u_)
+    , v(v_)
+    , host(host_)
+    , my_type(type)
+    , idepth_min(0)
+    , idepth_max(NAN)
+    , lastTraceStatus(IPS_UNINITIALIZED) {
 
-	for(int idx=0;idx<patternNum;idx++)
-	{
-		int dx = patternP[idx][0];
-		int dy = patternP[idx][1];
+    gradH.setZero();
 
-		// 由于+0.5导致积分, 插值得到值3个 [像素值, dx, dy]
-        Vec3f ptc = getInterpolatedElement33BiLin(host->dI, u+dx, v+dy,wG[0]); 
+    for (int idx = 0; idx < patternNum; idx++) {
+        int dx = patternP[idx][0];
+        int dy = patternP[idx][1];
 
+        /// 计算得到以当前[uv]为中心的pattern的host Frame 差值内容 [像素值, dx, dy]
+        Vec3f ptc = getInterpolatedElement33BiLin(host->dI, u + dx, v + dy, wG[0]);
 
+        /// 当差值获得的像素值为 finite 时，能量阈值设为NAN，后续会根据这个做判断，是否保留这个immaturepoint
+        color[idx] = ptc[0];
+        if (!std::isfinite(color[idx])) {
+            energyTH = NAN;
+            return;
+        }
 
-		color[idx] = ptc[0];
-		if(!std::isfinite(color[idx])) {energyTH=NAN; return;}
+        /// pattern的梯度矩阵[sum(dx*2), sum(dxdy); sum(dydx), sum(dy^2)]
+        gradH += ptc.tail<2>() * ptc.tail<2>().transpose();
 
-		// 梯度矩阵[dx*2, dxdy; dydx, dy^2]
-		gradH += ptc.tail<2>()  * ptc.tail<2>().transpose();
-		//! 点的权重 c^2 / ( c^2 + ||grad||^2 )
-		weights[idx] = sqrtf(setting_outlierTHSumComponent / (setting_outlierTHSumComponent + ptc.tail<2>().squaredNorm()));
-	}
+        /// pattern上的点的权重信息 c^2 / ( c^2 + ||grad||^2 )，防止大梯度为外点，导致Energy的剧烈变化
+        weights[idx] = sqrtf(setting_outlierTHSumComponent / (setting_outlierTHSumComponent + ptc.tail<2>().squaredNorm()));
+    }
 
-	energyTH = patternNum*setting_outlierTH;
-	energyTH *= setting_overallEnergyTHWeight*setting_overallEnergyTHWeight;
+    /// 根据setting设置energyTH，这里为什么不直接使用一个参数来和energyTH打交道，而是设置两个参数，是否有些麻烦
+    energyTH = patternNum * setting_outlierTH;
+    energyTH *= setting_overallEnergyTHWeight * setting_overallEnergyTHWeight;
 
-	idepth_GT=0;
-	quality=10000;
+    idepth_GT = 0;   ///< idepth_GT被初始化为0
+    quality = 10000; ///< 质量被初始化为1000
 }
 
-ImmaturePoint::~ImmaturePoint()
-{
-}
+ImmaturePoint::~ImmaturePoint() {}
 
-
-
-/* 
- * returns
- * * OOB -> point is optimized and marginalized
- * * UPDATED -> point has been updated.
- * * SKIP -> point has not been updated.
+/**
+ * @brief ImmaturePoint的深度估计，使用极线搜索 + GN优化的方式
+ * @details
+ *  1. 使用 idepth_min 和 idepth_max 选项来确定极线搜索的区域，和极线方向direction
+ *  2. 由于idepth无法确定，因此在极线搜索中，pi的pattern不能精确投影到pj中，因此DSO只考虑了KRKi对pattern的影响（个人认为使用w * w的窗口依然可行）
+ *  3. 根据极线方向和参考帧上，pi的pattern对应的像素梯度，建模由于不准确的极线导致的像素误差 error-pixel = 0.2 + 0.2 * (a + b) / a
+ *      3.1 a 近似代表了cos<l,g>的大小，即极线方向和像素梯度方向的夹角
+ *      3.2 b 近似代表了极线方向和像素等值线方向的夹角 --> 0.2 + 0.2 * (cos<l, g> ^2)
+ *  4. 使用极线初步确定 最佳匹配的像素后，使用 GN来构建优化问题，求解最佳的step 即 pj = pj0 + step * [lx, ly]^T
+ *      4.1 dr / dstep = (dr / dpj) * (dpj / dstep)
+ *  5. 确定好最佳匹配的 pj 后， 可以根据pj，考虑 error-pixel 产生的影响，可以计算出4个 idepth，从中选择出最大idepth_max 和 idepth_min
+ *  6. 更新idepth 范围，并返回跟踪状态
+ *
+ * @note 这里 唯一不理解的地方就是 极线搜索 像素误差的建模方法
+ *
+ * @param frame                 输入的前端确定位姿的帧
+ * @param hostToFrame_KRKi      输入的中间变量KRKi
+ * @param hostToFrame_Kt        输入的中间变量Kt
+ * @param hostToFrame_affine    输入的中间变量affine，用于构建残差
+ * @param HCalib                ---> 在函数中没有用到
+ * @param debugPrint            调试输出
+ * @return ImmaturePointStatus  当前ImmaturePoint是否跟踪成功
  */
- //@ 使用深度滤波对未成熟点进行深度估计
-ImmaturePointStatus ImmaturePoint::traceOn(FrameHessian* frame,const Mat33f &hostToFrame_KRKi, const Vec3f &hostToFrame_Kt, const Vec2f& hostToFrame_affine, CalibHessian* HCalib, bool debugPrint)
-{
-	if(lastTraceStatus == ImmaturePointStatus::IPS_OOB) return lastTraceStatus;
+ImmaturePointStatus ImmaturePoint::traceOn(FrameHessian *frame, const Mat33f &hostToFrame_KRKi, const Vec3f &hostToFrame_Kt, const Vec2f &hostToFrame_affine,
+                                           CalibHessian *HCalib, bool debugPrint) {
 
+    /// 针对搜索区域超出图像的，尺度变化大，两次优化残差大于阈值的，置为IPS_OOB
+    if (lastTraceStatus == ImmaturePointStatus::IPS_OOB)
+        return lastTraceStatus; ///< IPS_OOB状态的点，不需要进行优化
 
-	debugPrint = false;//rand()%100==0;
-	float maxPixSearch = (wG[0]+hG[0])*setting_maxPixSearch;  // 极限搜索的最大长度
+    debugPrint = false;
 
-	if(debugPrint)
-		printf("trace pt (%.1f %.1f) from frame %d to %d. Range %f -> %f. t %f %f %f!\n",
-				u,v,
-				host->shell->id, frame->shell->id,
-				idepth_min, idepth_max,
-				hostToFrame_Kt[0],hostToFrame_Kt[1],hostToFrame_Kt[2]);
+    /// 通过setting_maxPixSearch超参数，控制极线搜索的长度（与图像的分辨率有关）
+    float maxPixSearch = (wG[0] + hG[0]) * setting_maxPixSearch;
 
-	//	const float stepsize = 1.0;				// stepsize for initial discrete search.
-	//	const int GNIterations = 3;				// max # GN iterations
-	//	const float GNThreshold = 0.1;				// GN stop after this stepsize.
-	//	const float extraSlackOnTH = 1.2;			// for energy-based outlier check, be slightly more relaxed by this factor.
-	//	const float slackInterval = 0.8;			// if pixel-interval is smaller than this, leave it be.
-	//	const float minImprovementFactor = 2;		// if pixel-interval is smaller than this, leave it be.
-	
-	// ============== project min and max. return if one of them is OOB ===================
-//[ ***step 1*** ] 计算出来搜索的上下限, 对应idepth_max, idepth_min
-	Vec3f pr = hostToFrame_KRKi * Vec3f(u,v, 1);
-	Vec3f ptpMin = pr + hostToFrame_Kt*idepth_min;
-	float uMin = ptpMin[0] / ptpMin[2];
-	float vMin = ptpMin[1] / ptpMin[2];
+    if (debugPrint)
+        printf("trace pt (%.1f %.1f) from frame %d to %d. Range %f -> %f. t %f %f %f!\n", u, v, host->shell->id, frame->shell->id, idepth_min, idepth_max,
+               hostToFrame_Kt[0], hostToFrame_Kt[1], hostToFrame_Kt[2]);
 
-	// 如果超出图像范围则设为 OOB
-	if(!(uMin > 4 && vMin > 4 && uMin < wG[0]-5 && vMin < hG[0]-5))
-	{
-		if(debugPrint) printf("OOB uMin %f %f - %f %f %f (id %f-%f)!\n",
-				u,v,uMin, vMin,  ptpMin[2], idepth_min, idepth_max);
-		lastTraceUV = Vec2f(-1,-1);
-		lastTracePixelInterval=0;
-		return lastTraceStatus = ImmaturePointStatus::IPS_OOB;
-	}
+    /// idepth_min 对应的 像素坐标pj = (KRKi * [u, v, 1] + Kt * idepth_min) / Z
+    Vec3f pr = hostToFrame_KRKi * Vec3f(u, v, 1);
+    Vec3f ptpMin = pr + hostToFrame_Kt * idepth_min;
+    float uMin = ptpMin[0] / ptpMin[2];
+    float vMin = ptpMin[1] / ptpMin[2];
 
-	float dist;
-	float uMax;
-	float vMax;
-	Vec3f ptpMax;
-	if(std::isfinite(idepth_max))
-	{
-		ptpMax = pr + hostToFrame_Kt*idepth_max;
-		uMax = ptpMax[0] / ptpMax[2];
-		vMax = ptpMax[1] / ptpMax[2];
+    /// 如果超出图像范围则设为 OOB，border为4像素
+    if (!(uMin > 4 && vMin > 4 && uMin < wG[0] - 5 && vMin < hG[0] - 5)) {
+        if (debugPrint)
+            printf("OOB uMin %f %f - %f %f %f (id %f-%f)!\n", u, v, uMin, vMin, ptpMin[2], idepth_min, idepth_max);
+        lastTraceUV = Vec2f(-1, -1);
+        lastTracePixelInterval = 0;
+        return lastTraceStatus = ImmaturePointStatus::IPS_OOB;
+    }
 
+    float dist;
+    float uMax;
+    float vMax;
+    Vec3f ptpMax;
 
-		if(!(uMax > 4 && vMax > 4 && uMax < wG[0]-5 && vMax < hG[0]-5))
-		{
-			if(debugPrint) printf("OOB uMax  %f %f - %f %f!\n",u,v, uMax, vMax);
-			lastTraceUV = Vec2f(-1,-1);
-			lastTracePixelInterval=0;
-			return lastTraceStatus = ImmaturePointStatus::IPS_OOB;
-		}
+    /// idepth_max 对应的 像素坐标pj = (KRKi * [u, v, 1] + Kt * idepth_max) / Z
+    if (std::isfinite(idepth_max)) {
+        ptpMax = pr + hostToFrame_Kt * idepth_max;
+        uMax = ptpMax[0] / ptpMax[2];
+        vMax = ptpMax[1] / ptpMax[2];
 
+        /// 超出图像范围，设置为 OOB
+        if (!(uMax > 4 && vMax > 4 && uMax < wG[0] - 5 && vMax < hG[0] - 5)) {
+            if (debugPrint)
+                printf("OOB uMax  %f %f - %f %f!\n", u, v, uMax, vMax);
+            lastTraceUV = Vec2f(-1, -1);
+            lastTracePixelInterval = 0;
+            return lastTraceStatus = ImmaturePointStatus::IPS_OOB;
+        }
 
+        /// 检查极线搜索的区域大小，如果在1.5个像素之内，设置SKIPPED状态，代表无需优化了
+        dist = (uMin - uMax) * (uMin - uMax) + (vMin - vMax) * (vMin - vMax);
+        dist = sqrtf(dist);
+        if (dist < setting_trace_slackInterval) {
+            if (debugPrint)
+                printf("TOO CERTAIN ALREADY (dist %f)!\n", dist);
 
-		// ============== check their distance. everything below 2px is OK (-> skip). ===================
-		dist = (uMin-uMax)*(uMin-uMax) + (vMin-vMax)*(vMin-vMax);
-		dist = sqrtf(dist);
-		//* 搜索的范围太小
-		if(dist < setting_trace_slackInterval)
-		{
-			if(debugPrint)
-				printf("TOO CERTAIN ALREADY (dist %f)!\n", dist);
+            lastTraceUV = Vec2f(uMax + uMin, vMax + vMin) * 0.5; // 直接设为中值
+            lastTracePixelInterval = dist;
+            return lastTraceStatus = ImmaturePointStatus::IPS_SKIPPED;
+        }
 
-			lastTraceUV = Vec2f(uMax+uMin, vMax+vMin)*0.5;  // 直接设为中值
-			lastTracePixelInterval=dist;
-			return lastTraceStatus = ImmaturePointStatus::IPS_SKIPPED; //跳过
-		}
-		assert(dist>0);
-	}
-	else
-	{
-		//* 上限无穷大, 则设为最大值
-		dist = maxPixSearch;
+    } else {
+        /// idepth_max无穷大时，设置极线搜索大小为maxPixSearch
+        dist = maxPixSearch;
 
-		// project to arbitrary depth to get direction.
-		ptpMax = pr + hostToFrame_Kt*0.01;
-		uMax = ptpMax[0] / ptpMax[2];
-		vMax = ptpMax[1] / ptpMax[2];
+        /// 使用 idepth = 0.01 以此来确定极线的搜索方向
+        ptpMax = pr + hostToFrame_Kt * 0.01;
+        uMax = ptpMax[0] / ptpMax[2];
+        vMax = ptpMax[1] / ptpMax[2];
+        float dx = uMax - uMin;
+        float dy = vMax - vMin;
+        float d = 1.0f / sqrtf(dx * dx + dy * dy);
 
-		// direction.
-		float dx = uMax-uMin;
-		float dy = vMax-vMin;
-		float d = 1.0f / sqrtf(dx*dx+dy*dy);
+        /// 根据搜索方向和最大搜索长度确定 uMax和vMax
+        uMax = uMin + dist * dx * d;
+        vMax = vMin + dist * dy * d;
 
-		//* 根据比例得到最大值
-		// set to [setting_maxPixSearch].
-		uMax = uMin + dist*dx*d;
-		vMax = vMin + dist*dy*d;
+        /// 对非法投影区域的像素点，设置为OOB状态
+        if (!(uMax > 4 && vMax > 4 && uMax < wG[0] - 5 && vMax < hG[0] - 5)) {
+            if (debugPrint)
+                printf("OOB uMax-coarse %f %f %f!\n", uMax, vMax, ptpMax[2]);
+            lastTraceUV = Vec2f(-1, -1);
+            lastTracePixelInterval = 0;
+            return lastTraceStatus = ImmaturePointStatus::IPS_OOB;
+        }
+    }
 
-		// may still be out!
-		if(!(uMax > 4 && vMax > 4 && uMax < wG[0]-5 && vMax < hG[0]-5))
-		{
-			if(debugPrint) printf("OOB uMax-coarse %f %f %f!\n", uMax, vMax,  ptpMax[2]);
-			lastTraceUV = Vec2f(-1,-1);
-			lastTracePixelInterval=0;
-			return lastTraceStatus = ImmaturePointStatus::IPS_OOB;
-		}
-		assert(dist>0);
-	}
+    /// ptpMin[2]代表的是 dpi_min条件下，dpi / dpj 逆深度的比值 --> dj / di，如果深度比例之间不在0.75 - 1.5 之间，则认为是尺度变换过大
+    /// 这种情况下，同样需要将点设置为 OOB 状态，没有优化的必要
+    if (!(idepth_min < 0 || (ptpMin[2] > 0.75 && ptpMin[2] < 1.5))) {
+        if (debugPrint)
+            printf("OOB SCALE %f %f %f!\n", uMax, vMax, ptpMin[2]);
+        lastTraceUV = Vec2f(-1, -1);
+        lastTracePixelInterval = 0;
+        return lastTraceStatus = ImmaturePointStatus::IPS_OOB;
+    }
 
-	//? 为什么是这个值呢??? 0.75 - 1.5 
-	// 这个值是两个帧上深度的比值, 它的变化太大就是前后尺度变化太大了
-	// set OOB if scale change too big.
-	if(!(idepth_min<0 || (ptpMin[2]>0.75 && ptpMin[2]<1.5)))
-	{
-		if(debugPrint) printf("OOB SCALE %f %f %f!\n", uMax, vMax,  ptpMin[2]);
-		lastTraceUV = Vec2f(-1,-1);
-		lastTracePixelInterval=0;
-		return lastTraceStatus = ImmaturePointStatus::IPS_OOB;
-	}
+    float dx = setting_trace_stepsize * (uMax - uMin);
+    float dy = setting_trace_stepsize * (vMax - vMin);
 
-//[ ***step 2*** ] 计算误差大小(图像梯度和极线夹角大小), 夹角大, 小的几何误差会有很大影响
-	// ============== compute error-bounds on result in pixel. if the new interval is not at least 1/2 of the old, SKIP ===================
-	float dx = setting_trace_stepsize*(uMax-uMin);
-	float dy = setting_trace_stepsize*(vMax-vMin);
+    /// a = (lxdx + lydy) ^ 2，可以代表 host帧上的像素梯度 和 极线之间的夹角大小
+    float a = (Vec2f(dx, dy).transpose() * gradH * Vec2f(dx, dy));
+    /// b = (lydx - lxdy) ^ 2，可以代表 host帧上的像素等值线 和 极线方向的夹角大小
+    float b = (Vec2f(dy, -dx).transpose() * gradH * Vec2f(dy, -dx));
 
-	//! (dIx*dx + dIy*dy)^2
-	float a = (Vec2f(dx,dy).transpose() * gradH * Vec2f(dx,dy)); 
-	//! (dIx*dy - dIy*dx)^2
-	float b = (Vec2f(dy,-dx).transpose() * gradH * Vec2f(dy,-dx)); // (dx, dy)垂直方向的乘积
-	// 计算的是极线方向和梯度方向的夹角大小，90度则a=0, errorInPixel变大；平行时候b=0
-	float errorInPixel = 0.2f + 0.2f * (a+b) / a; // 没有使用LSD的方法, 估计是能有效防止位移小的情况
+    /// 误差像素为什么可以这样求解 0.2 + 0.2 / (cos(l, g) ^2)
+    float errorInPixel = 0.2f + 0.2f * (a + b) / a;
 
-	//* errorInPixel大说明垂直, 这时误差会很大, 视为bad
-	if(errorInPixel*setting_trace_minImprovementFactor > dist && std::isfinite(idepth_max))
-	{
-		if(debugPrint)
-			printf("NO SIGNIFICANT IMPROVMENT (%f)!\n", errorInPixel);
-		lastTraceUV = Vec2f(uMax+uMin, vMax+vMin)*0.5;
-		lastTracePixelInterval=dist;
-		return lastTraceStatus = ImmaturePointStatus::IPS_BADCONDITION;
-	}
+    /// 如果像素误差(极线l和像素梯度g决定的) 的两倍 大于 极线搜索的长度，则认为没有足够的优化，设置为 BADCONDITION 状态
+    if (errorInPixel * setting_trace_minImprovementFactor > dist && std::isfinite(idepth_max)) {
+        if (debugPrint)
+            printf("NO SIGNIFICANT IMPROVMENT (%f)!\n", errorInPixel);
+        lastTraceUV = Vec2f(uMax + uMin, vMax + vMin) * 0.5;
+        lastTracePixelInterval = dist;
+        return lastTraceStatus = ImmaturePointStatus::IPS_BADCONDITION;
+    }
 
-	if(errorInPixel >10) errorInPixel=10;
+    /// 下面的逆深度不确定性，要求这里的 errorInPixel <= 10, 规定了一个不确定性的尺度
+    if (errorInPixel > 10)
+        errorInPixel = 10;
 
+    dx /= dist; ///< cos(l) * step，u方向上的搜索步长
+    dy /= dist; ///< sin(l) * step，v方向上的搜索步长
 
+    if (debugPrint)
+        printf("trace pt (%.1f %.1f) from frame %d to %d. Range %f (%.1f %.1f) -> %f (%.1f %.1f)! ErrorInPixel %.1f!\n", u, v, host->shell->id,
+               frame->shell->id, idepth_min, uMin, vMin, idepth_max, uMax, vMax, errorInPixel);
 
-	// ============== do the discrete search ===================
-//[ ***step 3*** ] 在极线上找到最小的光度误差的位置, 并计算和第二次的比值作为质量
-	dx /= dist; // cos
-	dy /= dist;	// sin
+    /// 当线搜的范围大于要求的范围时，缩小线搜范围到要求的maxPixSearch，以idepth_min为起点
+    if (dist > maxPixSearch) {
+        uMax = uMin + maxPixSearch * dx;
+        vMax = vMin + maxPixSearch * dy;
+        dist = maxPixSearch;
+    }
 
-	if(debugPrint)
-		printf("trace pt (%.1f %.1f) from frame %d to %d. Range %f (%.1f %.1f) -> %f (%.1f %.1f)! ErrorInPixel %.1f!\n",
-				u,v,
-				host->shell->id, frame->shell->id,
-				idepth_min, uMin, vMin,
-				idepth_max, uMax, vMax,
-				errorInPixel
-				);
+    int numSteps = 1.9999f + dist / setting_trace_stepsize;
+    Mat22f Rplane = hostToFrame_KRKi.topLeftCorner<2, 2>();
 
+    float randShift = uMin * 1000 - floorf(uMin * 1000); ///< 获取uMin上千分位数上的小数部分
+    float ptx = uMin - randShift * dx;                   ///< 这里为什么不直接使用uMin的u（极线的允许误差模拟）
+    float pty = vMin - randShift * dy;                   ///< 这里为什么不直接使用vMin的v（极线的允许误差模拟）
 
-	if(dist>maxPixSearch)
-	{
-		uMax = uMin + maxPixSearch*dx;
-		vMax = vMin + maxPixSearch*dy;
-		dist = maxPixSearch;
-	}
+    /// 这里不使用投影的方式是有原因的，因为这里不会考虑由于dpi造成的影响，如果将dpi考虑在内，则会导致不确定的dpi计算不出pattern中Pi投影到pj中的位置
+    /// 所以这里，仅考虑pattern的一个小块，并且仅考虑旋转部分对小块造成的影响 --> 当然，我认为这里可以使用w * w的块来匹配
+    Vec2f rotatetPattern[MAX_RES_PER_POINT];
+    for (int idx = 0; idx < patternNum; idx++)
+        rotatetPattern[idx] = Rplane * Vec2f(patternP[idx][0], patternP[idx][1]);
 
-	int numSteps = 1.9999f + dist / setting_trace_stepsize; // 步数
-	Mat22f Rplane = hostToFrame_KRKi.topLeftCorner<2,2>();
+    /// 这个判断是否有意义
+    if (!std::isfinite(dx) || !std::isfinite(dy)) {
+        lastTracePixelInterval = 0;
+        lastTraceUV = Vec2f(-1, -1);
+        return lastTraceStatus = ImmaturePointStatus::IPS_OOB;
+    }
 
-	float randShift = uMin*1000-floorf(uMin*1000); // 	取小数点后面的做随机数??
-	float ptx = uMin-randShift*dx;
-	float pty = vMin-randShift*dy;
+    /// 沿着级线搜索误差最小的位置
+    float errors[100];
+    float bestU = 0, bestV = 0, bestEnergy = 1e10;
+    int bestIdx = -1;
 
-	//* pattern在新的帧上的偏移量
-	Vec2f rotatetPattern[MAX_RES_PER_POINT];
-	for(int idx=0;idx<patternNum;idx++)
-		rotatetPattern[idx] = Rplane * Vec2f(patternP[idx][0], patternP[idx][1]);
+    /// 除了超参数规定的最大搜索长度以外，还有一个硬性条件，搜索steps不能超过100step
+    if (numSteps >= 100)
+        numSteps = 99;
 
+    /// 沿着一个不太准确的极线，搜索一个不太准确的最优部分
+    for (int i = 0; i < numSteps; i++) {
+        float energy = 0;
+        for (int idx = 0; idx < patternNum; idx++) {
+            /// 求解某个pattern的 pi --> pj 的能量值
+            float hitColor = getInterpolatedElement31(frame->dI, (float)(ptx + rotatetPattern[idx][0]), (float)(pty + rotatetPattern[idx][1]), wG[0]);
 
+            if (!std::isfinite(hitColor)) {
+                energy += 1e5;
+                continue;
+            }
 
-	// 这个判断太多了, 学习学习, 全面考虑
-	if(!std::isfinite(dx) || !std::isfinite(dy))
-	{
-		//printf("COUGHT INF / NAN dxdy (%f %f)!\n", dx, dx);
+            /// 构建残差
+            float residual = hitColor - (float)(hostToFrame_affine[0] * color[idx] + hostToFrame_affine[1]);
+            float hw = fabs(residual) < setting_huberTH ? 1 : setting_huberTH / fabs(residual);
 
-		lastTracePixelInterval=0;
-		lastTraceUV = Vec2f(-1,-1);
-		return lastTraceStatus = ImmaturePointStatus::IPS_OOB;
-	}
+            /// 带有huber 核函数作用的能量
+            energy += hw * residual * residual * (2 - hw);
+        }
 
+        if (debugPrint)
+            printf("step %.1f %.1f (id %f): energy = %f!\n", ptx, pty, 0.0f, energy);
 
-	//* 沿着级线搜索误差最小的位置
-	float errors[100];
-	float bestU=0, bestV=0, bestEnergy=1e10;
-	int bestIdx=-1;
-	if(numSteps >= 100) numSteps = 99;
+        errors[i] = energy; ///< 用来寻找最优附近的次优内容，计算质量
+        if (energy < bestEnergy) {
+            bestU = ptx;
+            bestV = pty;
+            bestEnergy = energy;
+            bestIdx = i;
+        }
 
-	for(int i=0;i<numSteps;i++)
-	{
-		float energy=0;
-		for(int idx=0;idx<patternNum;idx++)
-		{
-			float hitColor = getInterpolatedElement31(frame->dI,
-										(float)(ptx+rotatetPattern[idx][0]),
-										(float)(pty+rotatetPattern[idx][1]),
-										wG[0]);
+        ptx += dx;
+        pty += dy;
+    }
 
-			if(!std::isfinite(hitColor)) {energy+=1e5; continue;}
-			float residual = hitColor - (float)(hostToFrame_affine[0] * color[idx] + hostToFrame_affine[1]);
-			float hw = fabs(residual) < setting_huberTH ? 1 : setting_huberTH / fabs(residual);
-			energy += hw *residual*residual*(2-hw);
-		}
+    /// 在2半径内，寻找一个次优点对应的energy
+    float secondBest = 1e10;
+    for (int i = 0; i < numSteps; i++) {
+        if ((i < bestIdx - setting_minTraceTestRadius || i > bestIdx + setting_minTraceTestRadius) && errors[i] < secondBest)
+            secondBest = errors[i];
+    }
 
-		if(debugPrint)
-			printf("step %.1f %.1f (id %f): energy = %f!\n",
-					ptx, pty, 0.0f, energy);
+    /// ImmaturePoint 质量更新比较考究
+    /// 1. 如果numSteps比较大，认为这个ImmaturePoint不够稳定，这时不论质量如何，都需要进行更新
+    /// 2. 如果numSteps比较小，认为这个ImmaturePoint比较稳定，这时如果质量低于阈值，就进行更新
+    /// 以此来获得一个 质量高切稳定的 ImmaturePoint
+    float newQuality = secondBest / bestEnergy;
+    if (newQuality < quality || numSteps > 10)
+        quality = newQuality;
 
+    /// 使用GN 旨在一个小范围内，找到一个最优的值
+    float uBak = bestU, vBak = bestV, gnstepsize = 1, stepBack = 0;
+    if (setting_trace_GNIterations > 0)
+        bestEnergy = 1e5;
 
-		errors[i] = energy;
-		if(energy < bestEnergy)
-		{
-			bestU = ptx; bestV = pty; bestEnergy = energy; bestIdx = i;
-		}
+    int gnStepsGood = 0, gnStepsBad = 0;
+    for (int it = 0; it < setting_trace_GNIterations; it++) {
+        float H = 1, b = 0, energy = 0;
+        for (int idx = 0; idx < patternNum; idx++) {
+            Vec3f hitColor = getInterpolatedElement33(frame->dI, (float)(bestU + rotatetPattern[idx][0]), (float)(bestV + rotatetPattern[idx][1]), wG[0]);
 
-		// 每次走1 dist对应大小
-		ptx+=dx; 
-		pty+=dy;
-	}
+            if (!std::isfinite((float)hitColor[0])) {
+                energy += 1e5;
+                continue;
+            }
+            float residual = hitColor[0] - (hostToFrame_affine[0] * color[idx] + hostToFrame_affine[1]);
+            float dResdDist = dx * hitColor[1] + dy * hitColor[2]; ///< J = drk / dstep = (dIi / dpi) * (dpi / dstep)
+            float hw = fabs(residual) < setting_huberTH ? 1 : setting_huberTH / fabs(residual);
 
-	//* 在一定的半径内找最到误差第二小的, 差的足够大, 才更好(这个常用)
-	// find best score outside a +-2px radius.
-	float secondBest=1e10;
-	for(int i=0;i<numSteps;i++)
-	{
-		if((i < bestIdx-setting_minTraceTestRadius || i > bestIdx+setting_minTraceTestRadius) && errors[i] < secondBest)
-			secondBest = errors[i];
-	}
-	float newQuality = secondBest / bestEnergy;
-	if(newQuality < quality || numSteps > 10) quality = newQuality;
+            H += hw * dResdDist * dResdDist;
+            b += hw * residual * dResdDist;
+            energy += weights[idx] * weights[idx] * hw * residual * residual * (2 - hw);
+        }
 
-//[ ***step 4*** ] 在上面的最优位置进行线性搜索, 进行求精
-	// ============== do GN optimization ===================
-	float uBak=bestU, vBak=bestV, gnstepsize=1, stepBack=0;
-	if(setting_trace_GNIterations>0) bestEnergy = 1e5;
-	int gnStepsGood=0, gnStepsBad=0;
-	for(int it=0;it<setting_trace_GNIterations;it++)
-	{
-		float H = 1, b=0, energy=0;
-		for(int idx=0;idx<patternNum;idx++)
-		{
-			Vec3f hitColor = getInterpolatedElement33(frame->dI,
-					(float)(bestU+rotatetPattern[idx][0]),
-					(float)(bestV+rotatetPattern[idx][1]),wG[0]);
+        /// 由于图像是一个非凸性很强的函数
+        if (energy > bestEnergy) {
+            gnStepsBad++;
 
-			if(!std::isfinite((float)hitColor[0])) {energy+=1e5; continue;}
-			float residual = hitColor[0] - (hostToFrame_affine[0] * color[idx] + hostToFrame_affine[1]);
-			float dResdDist = dx*hitColor[1] + dy*hitColor[2]; // 极线方向梯度
-			float hw = fabs(residual) < setting_huberTH ? 1 : setting_huberTH / fabs(residual);
+            /// 如果由于非凸性的原因导致了 energy 增加，使用 0.5 倍的回溯步长进行恢复
+            /// 猜测这里不完全恢复的原因，尝试找到一个合适的step，使得问题可解
+            stepBack *= 0.5;
+            bestU = uBak + stepBack * dx;
+            bestV = vBak + stepBack * dy;
+            if (debugPrint)
+                printf("GN BACK %d: E %f, H %f, b %f. id-step %f. UV %f %f -> %f %f.\n", it, energy, H, b, stepBack, uBak, vBak, bestU, bestV);
+        } else {
+            gnStepsGood++;
 
-			H += hw*dResdDist*dResdDist;
-			b += hw*residual*dResdDist;
-			energy += weights[idx]*weights[idx]*hw *residual*residual*(2-hw);
-		}
+            /// 在计算成功step后，还需要考虑gnstepsize的一个步长，防止二次函数的近似不足的情况发生
+            float step = -gnstepsize * b / H;
 
+            /// 在采用 倍数缩放 step后，还要保证每次的step的绝对值不能超过0.5个大小
+            if (step < -0.5)
+                step = -0.5;
+            else if (step > 0.5)
+                step = 0.5;
 
-		if(energy > bestEnergy)
-		{
-			gnStepsBad++;
+            if (!std::isfinite(step))
+                step = 0;
 
-			// do a smaller step from old point.
-			stepBack*=0.5;  		//* 减小步长再进行计算
-			bestU = uBak + stepBack*dx;
-			bestV = vBak + stepBack*dy;
-			if(debugPrint)
-				printf("GN BACK %d: E %f, H %f, b %f. id-step %f. UV %f %f -> %f %f.\n",
-						it, energy, H, b, stepBack,
-						uBak, vBak, bestU, bestV);
-		}
-		else
-		{
-			gnStepsGood++;
+            /// 保持当前状态和当前步长，用于后续能量增加时的回溯
+            uBak = bestU;
+            vBak = bestV;
+            stepBack = step;
 
-			float step = -gnstepsize*b/H;
-			//* 步长最大才0.5
-			if(step < -0.5) step = -0.5;
-			else if(step > 0.5) step=0.5;
+            bestU += step * dx;
+            bestV += step * dy;
+            bestEnergy = energy;
 
-			if(!std::isfinite(step)) step=0;
+            if (debugPrint)
+                printf("GN step %d: E %f, H %f, b %f. id-step %f. UV %f %f -> %f %f.\n", it, energy, H, b, step, uBak, vBak, bestU, bestV);
+        }
 
-			uBak=bestU; // 备份
-			vBak=bestV;
-			stepBack=step;
+        if (fabsf(stepBack) < setting_trace_GNThreshold)
+            break;
+    }
 
-			bestU += step*dx;
-			bestV += step*dy;
-			bestEnergy = energy;
+    /// 对优化后的能量，还是大于设定的阈值，则认为 ImmaturePoint 是外点，如果两次判断为外点，则置为OOB
+    if (!(bestEnergy < energyTH * setting_trace_extraSlackOnTH)) {
+        if (debugPrint)
+            printf("OUTLIER!\n");
 
-			if(debugPrint)
-				printf("GN step %d: E %f, H %f, b %f. id-step %f. UV %f %f -> %f %f.\n",
-						it, energy, H, b, step,
-						uBak, vBak, bestU, bestV);
-		}
+        lastTracePixelInterval = 0;
+        lastTraceUV = Vec2f(-1, -1);
+        if (lastTraceStatus == ImmaturePointStatus::IPS_OUTLIER)
+            return lastTraceStatus = ImmaturePointStatus::IPS_OOB; ///< 两次被判断为外点，置为OOB
+        else
+            return lastTraceStatus = ImmaturePointStatus::IPS_OUTLIER;
+    }
 
-		if(fabsf(stepBack) < setting_trace_GNThreshold) break;
-	}
+    /// 根据bestU和bestV可以分别计算出 idepth，DSO中将极线导致的像素误差考虑在内，得到四个idepth，将最大的设为idepth_max，最小的设为idepth_min
+    /// u = (pr[0] + Kt[0]*idepth) / (pr[2] + Kt[2]*idepth) ==> idepth = (u*pr[2] - pr[0]) / (Kt[0] - u*Kt[2])
+    /// v = (pr[1] + Kt[1]*idepth) / (pr[2] + Kt[2]*idepth) ==> idepth = (v*pr[2] - pr[1]) / (Kt[1] - v*Kt[2])
+    if (dx * dx > dy * dy) {
+        idepth_min = (pr[2] * (bestU - errorInPixel * dx) - pr[0]) / (hostToFrame_Kt[0] - hostToFrame_Kt[2] * (bestU - errorInPixel * dx));
+        idepth_max = (pr[2] * (bestU + errorInPixel * dx) - pr[0]) / (hostToFrame_Kt[0] - hostToFrame_Kt[2] * (bestU + errorInPixel * dx));
+    } else {
+        idepth_min = (pr[2] * (bestV - errorInPixel * dy) - pr[1]) / (hostToFrame_Kt[1] - hostToFrame_Kt[2] * (bestV - errorInPixel * dy));
+        idepth_max = (pr[2] * (bestV + errorInPixel * dy) - pr[1]) / (hostToFrame_Kt[1] - hostToFrame_Kt[2] * (bestV + errorInPixel * dy));
+    }
+    if (idepth_min > idepth_max)
+        std::swap<float>(idepth_min, idepth_max);
 
+    /// 判断idepth_min 和 idepth_max 是否合法，这里不判断 idepth_min 的原因是什么，为什么不直接置为OOB
+    if (!std::isfinite(idepth_min) || !std::isfinite(idepth_max) || (idepth_max < 0)) {
+        lastTracePixelInterval = 0;
+        lastTraceUV = Vec2f(-1, -1);
+        return lastTraceStatus = ImmaturePointStatus::IPS_OUTLIER;
+    }
 
-	// ============== detect energy-based outlier. ===================
-	//	float absGrad0 = getInterpolatedElement(frame->absSquaredGrad[0],bestU, bestV, wG[0]);
-	//	float absGrad1 = getInterpolatedElement(frame->absSquaredGrad[1],bestU*0.5-0.25, bestV*0.5-0.25, wG[1]);
-	//	float absGrad2 = getInterpolatedElement(frame->absSquaredGrad[2],bestU*0.25-0.375, bestV*0.25-0.375, wG[2]);
-	//* 残差太大, 则设置为外点
-	if(!(bestEnergy < energyTH*setting_trace_extraSlackOnTH))
-	//			|| (absGrad0*areaGradientSlackFactor < host->frameGradTH
-	//		     && absGrad1*areaGradientSlackFactor < host->frameGradTH*0.75f
-	//			 && absGrad2*areaGradientSlackFactor < host->frameGradTH*0.50f))
-	{
-		if(debugPrint)
-			printf("OUTLIER!\n");
-
-		lastTracePixelInterval=0;
-		lastTraceUV = Vec2f(-1,-1);
-		if(lastTraceStatus == ImmaturePointStatus::IPS_OUTLIER)   
-			return lastTraceStatus = ImmaturePointStatus::IPS_OOB;   //? 外点还有机会变回来???
-		else
-			return lastTraceStatus = ImmaturePointStatus::IPS_OUTLIER;
-	}
-
-//[ ***step 5*** ] 根据得到的最优位置重新计算逆深度的范围
-	// ============== set new interval ===================
-	//! u = (pr[0] + Kt[0]*idepth) / (pr[2] + Kt[2]*idepth) ==> idepth = (u*pr[2] - pr[0]) / (Kt[0] - u*Kt[2])
-	//! v = (pr[1] + Kt[1]*idepth) / (pr[2] + Kt[2]*idepth) ==> idepth = (v*pr[2] - pr[1]) / (Kt[1] - v*Kt[2])
-	//* 取误差最大的
-	if(dx*dx>dy*dy)
-	{
-		idepth_min = (pr[2]*(bestU-errorInPixel*dx) - pr[0]) / (hostToFrame_Kt[0] - hostToFrame_Kt[2]*(bestU-errorInPixel*dx));
-		idepth_max = (pr[2]*(bestU+errorInPixel*dx) - pr[0]) / (hostToFrame_Kt[0] - hostToFrame_Kt[2]*(bestU+errorInPixel*dx));
-	}
-	else
-	{
-		idepth_min = (pr[2]*(bestV-errorInPixel*dy) - pr[1]) / (hostToFrame_Kt[1] - hostToFrame_Kt[2]*(bestV-errorInPixel*dy));
-		idepth_max = (pr[2]*(bestV+errorInPixel*dy) - pr[1]) / (hostToFrame_Kt[1] - hostToFrame_Kt[2]*(bestV+errorInPixel*dy));
-	}
-	if(idepth_min > idepth_max) std::swap<float>(idepth_min, idepth_max);
-
-
-	if(!std::isfinite(idepth_min) || !std::isfinite(idepth_max) || (idepth_max<0))
-	{
-		//printf("COUGHT INF / NAN minmax depth (%f %f)!\n", idepth_min, idepth_max);
-
-		lastTracePixelInterval=0;
-		lastTraceUV = Vec2f(-1,-1);
-		return lastTraceStatus = ImmaturePointStatus::IPS_OUTLIER;
-	}
-
-	lastTracePixelInterval=2*errorInPixel; 	// 搜索的范围
-	lastTraceUV = Vec2f(bestU, bestV);		// 上一次得到的最有位置
-	return lastTraceStatus = ImmaturePointStatus::IPS_GOOD; 	//上一次的位置
+    lastTracePixelInterval = 2 * errorInPixel;              ///< 设置这个为下一次像素搜索范围的原因在于，idepth的不确定性是通过这个errorInPixel给出的
+    lastTraceUV = Vec2f(bestU, bestV);                      ///< 上一次得到的最优位置
+    return lastTraceStatus = ImmaturePointStatus::IPS_GOOD; ///< 上一次，使用极线搜索时，搜索的状态
 }
 
+float ImmaturePoint::getdPixdd(CalibHessian *HCalib, ImmaturePointTemporaryResidual *tmpRes, float idepth) {
+    FrameFramePrecalc *precalc = &(host->targetPrecalc[tmpRes->target->idx]);
+    const Vec3f &PRE_tTll = precalc->PRE_tTll;
+    float drescale, u = 0, v = 0, new_idepth;
+    float Ku, Kv;
+    Vec3f KliP;
 
-float ImmaturePoint::getdPixdd(
-		CalibHessian *  HCalib,
-		ImmaturePointTemporaryResidual* tmpRes,
-		float idepth)
-{
-	FrameFramePrecalc* precalc = &(host->targetPrecalc[tmpRes->target->idx]);
-	const Vec3f &PRE_tTll = precalc->PRE_tTll;
-	float drescale, u=0, v=0, new_idepth;
-	float Ku, Kv;
-	Vec3f KliP;
+    projectPoint(this->u, this->v, idepth, 0, 0, HCalib, precalc->PRE_RTll, PRE_tTll, drescale, u, v, Ku, Kv, KliP, new_idepth);
 
-	projectPoint(this->u,this->v, idepth, 0, 0,HCalib,
-			precalc->PRE_RTll,PRE_tTll, drescale, u, v, Ku, Kv, KliP, new_idepth);
-
-	float dxdd = (PRE_tTll[0]-PRE_tTll[2]*u)*HCalib->fxl();
-	float dydd = (PRE_tTll[1]-PRE_tTll[2]*v)*HCalib->fyl();
-	return drescale*sqrtf(dxdd*dxdd + dydd*dydd);
+    float dxdd = (PRE_tTll[0] - PRE_tTll[2] * u) * HCalib->fxl();
+    float dydd = (PRE_tTll[1] - PRE_tTll[2] * v) * HCalib->fyl();
+    return drescale * sqrtf(dxdd * dxdd + dydd * dydd);
 }
 
+float ImmaturePoint::calcResidual(CalibHessian *HCalib, const float outlierTHSlack, ImmaturePointTemporaryResidual *tmpRes, float idepth) {
+    FrameFramePrecalc *precalc = &(host->targetPrecalc[tmpRes->target->idx]);
 
-float ImmaturePoint::calcResidual(
-		CalibHessian *  HCalib, const float outlierTHSlack,
-		ImmaturePointTemporaryResidual* tmpRes,
-		float idepth)
-{
-	FrameFramePrecalc* precalc = &(host->targetPrecalc[tmpRes->target->idx]);
+    float energyLeft = 0;
+    const Eigen::Vector3f *dIl = tmpRes->target->dI;
+    const Mat33f &PRE_KRKiTll = precalc->PRE_KRKiTll;
+    const Vec3f &PRE_KtTll = precalc->PRE_KtTll;
+    Vec2f affLL = precalc->PRE_aff_mode;
 
-	float energyLeft=0;
-	const Eigen::Vector3f* dIl = tmpRes->target->dI;
-	const Mat33f &PRE_KRKiTll = precalc->PRE_KRKiTll;
-	const Vec3f &PRE_KtTll = precalc->PRE_KtTll;
-	Vec2f affLL = precalc->PRE_aff_mode;
+    for (int idx = 0; idx < patternNum; idx++) {
+        float Ku, Kv;
+        if (!projectPoint(this->u + patternP[idx][0], this->v + patternP[idx][1], idepth, PRE_KRKiTll, PRE_KtTll, Ku, Kv)) {
+            return 1e10;
+        }
 
-	for(int idx=0;idx<patternNum;idx++)
-	{
-		float Ku, Kv;
-		if(!projectPoint(this->u+patternP[idx][0], this->v+patternP[idx][1], idepth, PRE_KRKiTll, PRE_KtTll, Ku, Kv))
-			{return 1e10;}
+        Vec3f hitColor = (getInterpolatedElement33(dIl, Ku, Kv, wG[0]));
+        if (!std::isfinite((float)hitColor[0])) {
+            return 1e10;
+        }
+        // if(benchmarkSpecialOption==5) hitColor = (getInterpolatedElement13BiCub(tmpRes->target->I, Ku, Kv, wG[0]));
 
-		Vec3f hitColor = (getInterpolatedElement33(dIl, Ku, Kv, wG[0]));
-		if(!std::isfinite((float)hitColor[0])) {return 1e10;}
-		//if(benchmarkSpecialOption==5) hitColor = (getInterpolatedElement13BiCub(tmpRes->target->I, Ku, Kv, wG[0]));
+        float residual = hitColor[0] - (affLL[0] * color[idx] + affLL[1]);
 
-		float residual = hitColor[0] - (affLL[0] * color[idx] + affLL[1]);
+        float hw = fabsf(residual) < setting_huberTH ? 1 : setting_huberTH / fabsf(residual);
+        energyLeft += weights[idx] * weights[idx] * hw * residual * residual * (2 - hw);
+    }
 
-		float hw = fabsf(residual) < setting_huberTH ? 1 : setting_huberTH / fabsf(residual);
-		energyLeft += weights[idx]*weights[idx]*hw *residual*residual*(2-hw);
-	}
-
-	if(energyLeft > energyTH*outlierTHSlack)
-	{
-		energyLeft = energyTH*outlierTHSlack;
-	}
-	return energyLeft;
+    if (energyLeft > energyTH * outlierTHSlack) {
+        energyLeft = energyTH * outlierTHSlack;
+    }
+    return energyLeft;
 }
 
+/**
+ * @brief 计算 idepth 线性化点处的 能量的雅可比矩阵J和能量的海塞矩阵H
+ *
+ * @param HCalib            相机内参
+ * @param outlierTHSlack    外点阈值
+ * @param tmpRes            临时残差项
+ * @param Hdd               输出的能量的海塞矩阵 (idepth) --> 线性化
+ * @param bd                输出的雅可比矩阵 (idepth) --> 线性化
+ * @param idepth            输入的线性化点 idepth
+ * @return double   输出的能量值 E(idepth)
+ */
+double ImmaturePoint::linearizeResidual(CalibHessian *HCalib, const float outlierTHSlack, ImmaturePointTemporaryResidual *tmpRes, float &Hdd, float &bd,
+                                        float idepth) {
 
+    if (tmpRes->state_state == ResState::OOB) {
+        tmpRes->state_NewState = ResState::OOB;
+        return tmpRes->state_energy;
+    }
 
-//@ 计算当前点逆深度的残差, 正规方程(H和b), 残差状态
-double ImmaturePoint::linearizeResidual(
-		CalibHessian *  HCalib, const float outlierTHSlack,
-		ImmaturePointTemporaryResidual* tmpRes,
-		float &Hdd, float &bd,
-		float idepth)
-{
-	if(tmpRes->state_state == ResState::OOB)
-		{ tmpRes->state_NewState = ResState::OOB; return tmpRes->state_energy; }
+    /// 获取 未成熟点 ph 的host 和 target 的预计算信息
+    FrameFramePrecalc *precalc = &(host->targetPrecalc[tmpRes->target->idx]);
 
-	FrameFramePrecalc* precalc = &(host->targetPrecalc[tmpRes->target->idx]);
+    float energyLeft = 0;
+    const Eigen::Vector3f *dIl = tmpRes->target->dI; ///< 第target的0层 [能量值， 梯度值]
+    const Mat33f &PRE_RTll = precalc->PRE_RTll;      ///< 优化之后的旋转矩阵Rth
+    const Vec3f &PRE_tTll = precalc->PRE_tTll;       ///< 优化之后的平移向量tth
+    Vec2f affLL = precalc->PRE_aff_mode;             ///< ath, bth
 
-	// check OOB due to scale angle change.
+    for (int idx = 0; idx < patternNum; idx++) {
+        int dx = patternP[idx][0];
+        int dy = patternP[idx][1];
 
-	float energyLeft=0;
-	const Eigen::Vector3f* dIl = tmpRes->target->dI;
-	const Mat33f &PRE_RTll = precalc->PRE_RTll;
-	const Vec3f &PRE_tTll = precalc->PRE_tTll;
-	//const float * const Il = tmpRes->target->I;
+        float drescale, u, v, new_idepth;
+        float Ku, Kv;
+        Vec3f KliP;
 
-	Vec2f affLL = precalc->PRE_aff_mode;
+        if (!projectPoint(this->u, this->v, idepth, dx, dy, HCalib, PRE_RTll, PRE_tTll, drescale, u, v, Ku, Kv, KliP, new_idepth)) {
+            tmpRes->state_NewState = ResState::OOB;
+            return tmpRes->state_energy;
+        }
 
-	for(int idx=0;idx<patternNum;idx++)
-	{
-		int dx = patternP[idx][0];
-		int dy = patternP[idx][1];
+        Vec3f hitColor = (getInterpolatedElement33(dIl, Ku, Kv, wG[0])); ///< 根据双线性插值计算 I, dI / dx, dI / dy
 
-		float drescale, u, v, new_idepth;
-		float Ku, Kv;
-		Vec3f KliP;
+        if (!std::isfinite((float)hitColor[0])) {
+            tmpRes->state_NewState = ResState::OOB;
+            return tmpRes->state_energy;
+        }
 
-		if(!projectPoint(this->u,this->v, idepth, dx, dy,HCalib,
-				PRE_RTll,PRE_tTll, drescale, u, v, Ku, Kv, KliP, new_idepth))
-			{tmpRes->state_NewState = ResState::OOB; return tmpRes->state_energy;}
+        /// 计算残差 rk = Ij[pj] - aji * Ii[pi] - bji
+        float residual = hitColor[0] - (affLL[0] * color[idx] + affLL[1]);
 
+        float hw = fabsf(residual) < setting_huberTH ? 1 : setting_huberTH / fabsf(residual); ///< huber 核函数
+        energyLeft += weights[idx] * weights[idx] * hw * residual * residual * (2 - hw);      ///< 能量值
 
-		Vec3f hitColor = (getInterpolatedElement33(dIl, Ku, Kv, wG[0]));
+        float dxInterp = hitColor[1] * HCalib->fxl(); ///< dx * fx
+        float dyInterp = hitColor[2] * HCalib->fyl(); ///< dy * fy
 
-		if(!std::isfinite((float)hitColor[0])) {tmpRes->state_NewState = ResState::OOB; return tmpRes->state_energy;}
-		float residual = hitColor[0] - (affLL[0] * color[idx] + affLL[1]);
+        /// 获取残差对逆深度的雅可比矩阵 drk / ddpi (J * A)
+        float d_idepth = derive_idepth(PRE_tTll, u, v, dx, dy, dxInterp, dyInterp, drescale);
 
-		float hw = fabsf(residual) < setting_huberTH ? 1 : setting_huberTH / fabsf(residual);
-		energyLeft += weights[idx]*weights[idx]*hw *residual*residual*(2-hw);
+        hw *= weights[idx] * weights[idx];
 
-		// depth derivatives.
-		float dxInterp = hitColor[1]*HCalib->fxl();
-		float dyInterp = hitColor[2]*HCalib->fyl();
-		float d_idepth = derive_idepth(PRE_tTll, u, v, dx, dy, dxInterp, dyInterp, drescale); // 对逆深度的导数
+        Hdd += (hw * d_idepth) * d_idepth; /// 近似E对逆深度的hessian
+        bd += (hw * residual) * d_idepth;  /// 近似E对逆深度的Jacobian
+    }
 
-		hw *= weights[idx]*weights[idx];
+    /// 内点和外点的判别，使用energyTH 和 outlierTHSlack 判断
+    if (energyLeft > energyTH * outlierTHSlack) {
+        energyLeft = energyTH * outlierTHSlack;
+        tmpRes->state_NewState = ResState::OUTLIER;
+    } else {
+        tmpRes->state_NewState = ResState::IN;
+    }
 
-		Hdd += (hw*d_idepth)*d_idepth; // 对逆深度的hessian
-		bd += (hw*residual)*d_idepth; // 对逆深度的Jres
-	}
-
-
-	if(energyLeft > energyTH*outlierTHSlack)
-	{
-		energyLeft = energyTH*outlierTHSlack;
-		tmpRes->state_NewState = ResState::OUTLIER;
-	}
-	else
-	{
-		tmpRes->state_NewState = ResState::IN;
-	}
-
-	tmpRes->state_NewEnergy = energyLeft;
-	return energyLeft;
+    tmpRes->state_NewEnergy = energyLeft;
+    return energyLeft;
 }
 
-
-
-}
+} // namespace dso

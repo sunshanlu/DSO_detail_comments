@@ -42,7 +42,7 @@ inline Vec2 affFromTo(const Vec2 &from, const Vec2 &to) // contains affine param
     return Vec2(from[0] / to[0], (from[1] - to[1]) / to[0]);
 }
 
-//提前声明下
+// 提前声明下
 struct FrameHessian;
 struct PointHessian;
 
@@ -62,7 +62,7 @@ class EFPoint;
 #define SCALE_A 10.0f       //!< 光度仿射系数a的比例系数
 #define SCALE_B 1000.0f     //!< 光度仿射系数b的比例系数
 
-//上面的逆
+// 上面的逆
 #define SCALE_IDEPTH_INVERSE (1.0f / SCALE_IDEPTH)
 #define SCALE_XI_ROT_INVERSE (1.0f / SCALE_XI_ROT)
 #define SCALE_XI_TRANS_INVERSE (1.0f / SCALE_XI_TRANS)
@@ -142,14 +142,12 @@ struct FrameHessian {
     Vec10 step_backup;  //!< 上一次的增量备份
     Vec10 state_backup; //!< 上一次状态的备份
 
-    //内联提高效率, 返回上面的值
+    // 内联提高效率, 返回上面的值
     EIGEN_STRONG_INLINE const SE3 &get_worldToCam_evalPT() const { return worldToCam_evalPT; }
     EIGEN_STRONG_INLINE const Vec10 &get_state_zero() const { return state_zero; }
     EIGEN_STRONG_INLINE const Vec10 &get_state() const { return state; }
     EIGEN_STRONG_INLINE const Vec10 &get_state_scaled() const { return state_scaled; }
-    EIGEN_STRONG_INLINE const Vec10 get_state_minus_stateZero() const {
-        return get_state() - get_state_zero();
-    } // x小量可以直接减
+    EIGEN_STRONG_INLINE const Vec10 get_state_minus_stateZero() const { return get_state() - get_state_zero(); } // x小量可以直接减
 
     // precalc values
     SE3 PRE_worldToCam; //!< 预计算的, 位姿状态增量更新到位姿上
@@ -158,12 +156,10 @@ struct FrameHessian {
     MinimalImageB3 *debugImage;                                                                //!< 小图???
 
     inline Vec6 w2c_leftEps() const { return get_state_scaled().head<6>(); } //* 返回位姿状态增量
-    inline AffLight aff_g2l() const {
-        return AffLight(get_state_scaled()[6], get_state_scaled()[7]);
-    } //* 返回光度仿射系数
-    inline AffLight aff_g2l_0() const {
-        return AffLight(get_state_zero()[6] * SCALE_A, get_state_zero()[7] * SCALE_B);
-    } //* 返回线性化点处的仿射系数增量
+
+    inline AffLight aff_g2l() const { return AffLight(get_state_scaled()[6], get_state_scaled()[7]); } //* 返回光度仿射系数
+
+    inline AffLight aff_g2l_0() const { return AffLight(get_state_zero()[6] * SCALE_A, get_state_zero()[7] * SCALE_B); } //* 返回线性化点处的仿射系数增量
 
     //* 设置FEJ点状态增量
     void setStateZero(const Vec10 &state_zero);
@@ -176,12 +172,20 @@ struct FrameHessian {
         state_scaled[7] = SCALE_B * state[7];
         state_scaled[8] = SCALE_A * state[8];
         state_scaled[9] = SCALE_B * state[9];
-        //位姿更新
+        // 位姿更新
         PRE_worldToCam = SE3::exp(w2c_leftEps()) * get_worldToCam_evalPT();
         PRE_camToWorld = PRE_worldToCam.inverse();
         // setCurrentNullspace();
     };
-    //* 设置增量, 传入state_scaled
+
+    /**
+     * @brief 根据缩放的状态增量，将状态增量的缩放还原回去，并对Tcw_pre和Twc_pre进行更新
+     * @details
+     *  1. 使用尺度缩放，将状态增量进行还原 state_scaled --> state
+     *  2. 对PRE_worldToCam（Tcw_pre），进行状态更新-->使用的是state_scaled（没有进行尺度还原！）
+     *  3. 对PRE_camToWorld（Twc_pre）进行状态更新-->使用的是state_scaled（没有进行尺度还原！）
+     * @param state_scaled 输入的缩放状态增量
+     */
     inline void setStateScaled(const Vec10 &state_scaled) {
 
         this->state_scaled = state_scaled;
@@ -192,10 +196,10 @@ struct FrameHessian {
         state[8] = SCALE_A_INVERSE * state_scaled[8];
         state[9] = SCALE_B_INVERSE * state_scaled[9];
 
-        PRE_worldToCam = SE3::exp(w2c_leftEps()) * get_worldToCam_evalPT();
-        PRE_camToWorld = PRE_worldToCam.inverse();
-        // setCurrentNullspace();
+        PRE_worldToCam = SE3::exp(w2c_leftEps()) * get_worldToCam_evalPT(); ///< 这部分带着尺度呢
+        PRE_camToWorld = PRE_worldToCam.inverse();                          ///< 这部分也带着尺度呢
     };
+
     //* 设置当前位姿, 和状态增量, 同时设置了FEJ点
     inline void setEvalPT(const SE3 &worldToCam_evalPT, const Vec10 &state) {
 
@@ -204,14 +208,25 @@ struct FrameHessian {
         setStateZero(state);
     };
 
-    //* 设置当前位姿, 光度仿射系数, FEJ点
+    /**
+     * @brief 设置 状态估计问题的 初始值 （Tcw, a, b, FEJ, nullspace）
+     * @details
+     *  1. 设置 worldToCam_evalPT （但是目前并不明白其意义）
+     *  2. 将初始化增量设置为 [0,0,0,0,0,0,a,b,0,0]-->initial_state
+     *  3. 将initial_state状态，进行尺度还原，得到state，并将initial_state赋值给state_scaled
+     *  4. 使用state_scaled部分，进行PRE_worldToCam，PRE_camToWorld的状态更新（这里还包含着尺度，不过似乎没有用，位姿部分0增量）
+     *  5. 使用state，作为当前的线性化点FEJ，并计算状态的零空间（nullspace）
+     * @param worldToCam_evalPT 输入的待估计的相机位姿状态 Tcw
+     * @param aff_g2l 输入的待估计的光度仿射系数 aj, bj
+     */
     inline void setEvalPT_scaled(const SE3 &worldToCam_evalPT, const AffLight &aff_g2l) {
         Vec10 initial_state = Vec10::Zero();
-        initial_state[6] = aff_g2l.a; // 直接设置光度系数a和b
-        initial_state[7] = aff_g2l.b;
-        this->worldToCam_evalPT = worldToCam_evalPT;
-        setStateScaled(initial_state);
-        setStateZero(this->get_state());
+
+        initial_state[6] = aff_g2l.a;                ///< 光度系数a
+        initial_state[7] = aff_g2l.b;                ///< 光度系数b
+        this->worldToCam_evalPT = worldToCam_evalPT; ///< Tcw，worldToCam_evalPT（这个变量和普通的PRE开头有什么区别？）
+        setStateScaled(initial_state);               ///< 设置状态，state，PRE_worldToCam，PRE_camToWorld
+        setStateZero(this->get_state());             ///< 使用state计算设置线性化状态点，并计算状态零空间
     };
 
     //* 释放该帧内存
@@ -292,26 +307,32 @@ struct CalibHessian {
     VecC value_minus_value_zero; //!< 减去线性化点
 
     inline ~CalibHessian() { instanceCounter--; }
+
+    /**
+     * @brief CalibHessian的构造函数
+     *
+     */
     inline CalibHessian() {
 
         VecC initial_value = VecC::Zero();
-        //* 初始化内参
-        initial_value[0] = fxG[0];
-        initial_value[1] = fyG[0];
-        initial_value[2] = cxG[0];
-        initial_value[3] = cyG[0];
 
-        setValueScaled(initial_value);
-        value_zero = value;
-        value_minus_value_zero.setZero();
+        initial_value[0] = fxG[0]; ///< fx0
+        initial_value[1] = fyG[0]; ///< fy0
+        initial_value[2] = cxG[0]; ///< cx0
+        initial_value[3] = cyG[0]; ///< cy0
+
+        setValueScaled(initial_value);    ///< 好像 value_sacled 才是真正的K
+        value_zero = value;               ///< FEJ 初始值，使其 K / 50
+        value_minus_value_zero.setZero(); ///< value - nullspace 置为0
 
         instanceCounter++;
-        //响应函数
+
+        /// 响应函数设置
         for (int i = 0; i < 256; i++)
-            Binv[i] = B[i] = i; // set gamma function to identity
+            Binv[i] = B[i] = i; ///< 相应函数G的初始化而已，在后续会设置gammaFunction
     };
 
-    // normal mode: use the optimized parameters everywhere!
+    /// 使用 fxl, fyl, cxl, cyl, fxli, fyli, cxli, cyli 返回的都是真实K的内容，即value_scaledf的内容
     inline float &fxl() { return value_scaledf[0]; }
     inline float &fyl() { return value_scaledf[1]; }
     inline float &cxl() { return value_scaledf[2]; }
@@ -326,7 +347,7 @@ struct CalibHessian {
         // [0-3: Kl, 4-7: Kr, 8-12: l2r] what's this, stereo camera???
         this->value = value;
         value_scaled[0] = SCALE_F * value[0];
-        value_scaled[1] = SCALE_F * value[1];
+        value_scaled[1] = 1 * value[1];
         value_scaled[2] = SCALE_C * value[2];
         value_scaled[3] = SCALE_C * value[3];
 
@@ -337,34 +358,41 @@ struct CalibHessian {
         this->value_scaledi[3] = -this->value_scaledf[3] / this->value_scaledf[1];
         this->value_minus_value_zero = this->value - this->value_zero;
     };
-    //* 通过value_scaled赋值
-    inline void setValueScaled(const VecC &value_scaled) {
-        this->value_scaled = value_scaled;
-        this->value_scaledf = this->value_scaled.cast<float>();
-        value[0] = SCALE_F_INVERSE * value_scaled[0];
-        value[1] = SCALE_F_INVERSE * value_scaled[1];
-        value[2] = SCALE_C_INVERSE * value_scaled[2];
-        value[3] = SCALE_C_INVERSE * value_scaled[3];
 
-        this->value_minus_value_zero = this->value - this->value_zero;
-        this->value_scaledi[0] = 1.0f / this->value_scaledf[0];
-        this->value_scaledi[1] = 1.0f / this->value_scaledf[1];
-        this->value_scaledi[2] = -this->value_scaledf[2] / this->value_scaledf[0];
-        this->value_scaledi[3] = -this->value_scaledf[3] / this->value_scaledf[1];
+    /**
+     * @brief 对 相机参数 设置值，其中
+     *
+     * @param value_scaled
+     */
+    inline void setValueScaled(const VecC &value_scaled) {
+        this->value_scaled = value_scaled;                      ///< 设置value_scaled
+        this->value_scaledf = this->value_scaled.cast<float>(); ///< float类型的value_scaled
+
+        value[0] = SCALE_F_INVERSE * value_scaled[0]; ///< fx0 / 50
+        value[1] = SCALE_F_INVERSE * value_scaled[1]; ///< fy0 / 50
+        value[2] = SCALE_C_INVERSE * value_scaled[2]; ///< cx0 / 50
+        value[3] = SCALE_C_INVERSE * value_scaled[3]; ///< cy0 / 50
+
+        this->value_minus_value_zero = this->value - this->value_zero; ///< 获取去除零空的部分value
+
+        this->value_scaledi[0] = 1.0f / this->value_scaledf[0];                    ///< 1 / fx0
+        this->value_scaledi[1] = 1.0f / this->value_scaledf[1];                    ///< 1 / fy0
+        this->value_scaledi[2] = -this->value_scaledf[2] / this->value_scaledf[0]; ///< 1 / cx0
+        this->value_scaledi[3] = -this->value_scaledf[3] / this->value_scaledf[1]; ///< 1 / cy0
     };
 
     //* gamma函数, 相机的响应函数G和G^-1, 映射到0~255
     float Binv[256];
     float B[256];
 
-    //* 响应函数的导数
+    /// 获取G函数的导数，在color上的值 dG / dI'
     EIGEN_STRONG_INLINE float getBGradOnly(float color) {
         int c = color + 0.5f;
         if (c < 5)
             c = 5;
         if (c > 250)
             c = 250;
-        return B[c + 1] - B[c];
+        return B[c + 1] - B[c]; /// gamma相应函数的梯度
     }
     //* 响应函数逆的导数
     EIGEN_STRONG_INLINE float getBInvGradOnly(float color) {
@@ -394,7 +422,7 @@ struct PointHessian {
     FrameHessian *host; //!< 主帧
     bool hasDepthPrior; //!< 初始化得到的点是有深度先验的, 其它没有
 
-    float my_type; //不同类型点, 显示用
+    float my_type; // 不同类型点, 显示用
 
     float idepth_scaled;      //!< target还是host上点逆深度 ??
     float idepth_zero_scaled; //!< FEJ使用, 点在host上x=0初始逆深度
@@ -414,7 +442,11 @@ struct PointHessian {
 
     inline void setPointStatus(PtStatus s) { status = s; }
 
-    //* 各种设置逆深度
+    /**
+     * @brief 设置 idepth 和 idepth_scaled
+     *
+     * @param idepth    输入的逆深度
+     */
     inline void setIdepth(float idepth) {
         this->idepth = idepth;
         this->idepth_scaled = SCALE_IDEPTH * idepth;
@@ -423,15 +455,20 @@ struct PointHessian {
         this->idepth = SCALE_IDEPTH_INVERSE * idepth_scaled;
         this->idepth_scaled = idepth_scaled;
     }
+
+    /**
+     * @brief 设置线性化状态 idepth_zero idepth_zero_scaled 和 nullspaces_scale
+     *
+     * @param idepth   输入的逆深度
+     */
     inline void setIdepthZero(float idepth) {
         idepth_zero = idepth;
         idepth_zero_scaled = SCALE_IDEPTH * idepth;
-        nullspaces_scale = -(idepth * 1.001 - idepth / 1.001) * 500; //? 为啥这么求
+        nullspaces_scale = -(idepth * 1.001 - idepth / 1.001) * 500; ///< 这算出来为0？
     }
 
     //* 点的残差值
-    std::vector<PointFrameResidual *>
-        residuals; // only contains good residuals (not OOB and not OUTLIER). Arbitrary order.
+    std::vector<PointFrameResidual *> residuals;                // only contains good residuals (not OOB and not OUTLIER). Arbitrary order.
     std::pair<PointFrameResidual *, ResState> lastResiduals[2]; // contains information about residuals to the last two
                                                                 // (!) frames. ([0] = latest, [1] = the one before).
 
@@ -444,41 +481,60 @@ struct PointHessian {
         instanceCounter--;
     }
 
-    //@ 判断其它帧上的点是否不值得要了
+    /**
+     * @brief 判断某个点是否需要被丢掉或者被边缘化掉
+     * @details
+     *  1. 如果边缘化某个帧后，使得该点拥有的残差数量较少，那么该点会标记为边缘化或丢掉
+     *  2. 如果最新帧看不到该点时，那么该点会被标记为边缘化或丢掉
+     *  3. 判断该点和最后两帧之间的残差被判断为外点，则该点会被标记为边缘化或丢掉
+     *
+     * @param toKeep    没用到，没什么用
+     * @param toMarg    需要被边缘化的帧
+     * @return true     需要被丢掉或者被边缘化掉
+     * @return false    不能被丢掉或者边缘化掉
+     */
     inline bool isOOB(const std::vector<FrameHessian *> &toKeep, const std::vector<FrameHessian *> &toMarg) const {
 
+        /// 统计某个pointHessian被待边缘化帧看到的次数
         int visInToMarg = 0;
         for (PointFrameResidual *r : residuals) {
             if (r->state_state != ResState::IN)
                 continue;
             for (FrameHessian *k : toMarg)
                 if (r->target == k)
-                    visInToMarg++; // 在要边缘化掉的帧被观测的数量
+                    visInToMarg++;
         }
-        //[1]: 原本是很好的一个点，但是边缘化一帧后，残差变太少了, 边缘化or丢掉
-        if ((int)residuals.size() >= setting_minGoodActiveResForMarg && // 残差数大于一定数目
-            numGoodResiduals > setting_minGoodResForMarg + 10 &&
-            (int)residuals.size() - visInToMarg < setting_minGoodActiveResForMarg) //剩余残差足够少
+
+        /// 原本是很好的一个点，但是边缘化一帧后，残差变太少了, 边缘化or丢掉
+        if ((int)residuals.size() >= setting_minGoodActiveResForMarg &&                                                                 // 残差数大于一定数目
+            numGoodResiduals > setting_minGoodResForMarg + 10 && (int)residuals.size() - visInToMarg < setting_minGoodActiveResForMarg) // 剩余残差足够少
             return true;
 
-        //[2]: 最新一帧的投影在图像外了, 看不见了, 边缘化or丢掉
-        // 或者满足以下条件,
+        /// 最新一帧的投影在图像外了, 看不见了, 边缘化or丢掉
         if (lastResiduals[0].second == ResState::OOB)
-            return true; //上一帧是OOB
-        //[3]: 残差比较少, 新加入的, 不边缘化
+            return true;
+
+        /// 残差比较少, 新加入的, 不边缘化
         if (residuals.size() < 2)
-            return false; //观测较少不设置为OOB
-        //[4]: 前两帧投影都是外点, 边缘化or丢掉
+            return false;
+
+        /// 最后两帧投影都是外点, 边缘化or丢掉
         if (lastResiduals[0].second == ResState::OUTLIER && lastResiduals[1].second == ResState::OUTLIER)
-            return true; //前两帧都是外点
+            return true;
+
         return false;
     }
 
-    //内点条件
-    inline bool isInlierNew() {
-        return (int)residuals.size() >= setting_minGoodActiveResForMarg &&
-               numGoodResiduals >= setting_minGoodResForMarg;
-    }
+    /**
+     * @brief 判断当前的PointHessian是否是内点
+     * @details
+     *  1. 目前维护的残差数量要大于等于3
+     *  2. 当前点构建的所有好残差的数量（包括那些已经被丢弃和边缘化的）要大于等于4
+     *
+     * @return true     是内点
+     * @return false    不是内点
+     */
+    inline bool isInlierNew() { return (int)residuals.size() >= setting_minGoodActiveResForMarg && numGoodResiduals >= setting_minGoodResForMarg; }
 };
 
 } // namespace dso

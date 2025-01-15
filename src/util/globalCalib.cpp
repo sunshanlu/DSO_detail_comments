@@ -48,12 +48,21 @@ Eigen::Matrix3f KiG[PYR_LEVELS]; ///< 金字塔每层的K矩阵的逆，相机�
 float wM3G; ///< 第0层的宽度-3
 float hM3G; ///< 第0层的高度-3
 
+/**
+ * @brief 根据输入的w,h,K，设置金字塔相机参数
+ *
+ * @param w 输入的宽度
+ * @param h 输入的高度
+ * @param K 输入的内参矩阵
+ */
 void setGlobalCalib(int w, int h, const Eigen::Matrix3f &K) {
-    int wlvl = w;      ///< 金字塔最上层的宽度
-    int hlvl = h;      ///< 金字塔最上层的高度
+    int wlvl = w;      ///< lvl层上的宽
+    int hlvl = h;      ///< lvl层上的高
     pyrLevelsUsed = 1; ///< 一共有几层金字塔
 
-    /// 这里要求存pinhole模型的宽度和高度应该尽量多的是2的整数次幂，最多除六次2，也就是最多7层金字塔
+    /// wlvl 和 hlvl 可以被2整除
+    /// 目前的像素个数超过5000
+    /// 金字塔层级比6小（0……5）
     while (wlvl % 2 == 0 && hlvl % 2 == 0 && wlvl * hlvl > 5000 && pyrLevelsUsed < PYR_LEVELS) {
         wlvl /= 2;
         hlvl /= 2;
@@ -79,6 +88,7 @@ void setGlobalCalib(int w, int h, const Eigen::Matrix3f &K) {
     wM3G = w - 3;
     hM3G = h - 3;
 
+    /// 设置金字塔第零层的相机内参
     wG[0] = w;
     hG[0] = h;
     KG[0] = K;
@@ -92,6 +102,7 @@ void setGlobalCalib(int w, int h, const Eigen::Matrix3f &K) {
     cxiG[0] = KiG[0](0, 2);
     cyiG[0] = KiG[0](1, 2);
 
+    /// 设置其他层上的相机参数
     for (int level = 1; level < pyrLevelsUsed; ++level) {
         wG[level] = w >> level;
         hG[level] = h >> level;
@@ -103,7 +114,7 @@ void setGlobalCalib(int w, int h, const Eigen::Matrix3f &K) {
         cxG[level] = (cxG[0] + 0.5) / ((int)1 << level) - 0.5;
         cyG[level] = (cyG[0] + 0.5) / ((int)1 << level) - 0.5;
 
-        KG[level] << fxG[level], 0.0, cxG[level], 0.0, fyG[level], cyG[level], 0.0, 0.0, 1.0; // synthetic
+        KG[level] << fxG[level], 0.0, cxG[level], 0.0, fyG[level], cyG[level], 0.0, 0.0, 1.0;
         KiG[level] = KG[level].inverse();
 
         fxiG[level] = KiG[level](0, 0);

@@ -101,6 +101,14 @@ struct PrepImageItem {
 
 class ImageFolderReader {
 public:
+    /**
+     * @brief ImageFolderReader 图像文件夹读取器（构造）
+     *
+     * @param path          输入的图像文件夹路径
+     * @param calibFile     相机的标定文件
+     * @param gammaFile     相机的gamma映射函数
+     * @param vignetteFile  相机的渐晕映射函数
+     */
     ImageFolderReader(std::string path, std::string calibFile, std::string gammaFile, std::string vignetteFile) {
         this->path = path;
         this->calibfile = calibFile;
@@ -109,7 +117,7 @@ public:
         ziparchive = 0;
         databuffer = 0;
 #endif
-
+        /// 使用path的后缀判断是否是.zip判断 数据是否为压缩包
         isZipped = (path.length() > 4 && path.substr(path.length() - 4) == ".zip");
 
         /// 对zip格式的数据集，使用ziplib库进行读取
@@ -141,20 +149,18 @@ public:
 #endif
         } else {
             /// 如果是文件夹形式的数据库，可以直接使用c语言的DIR文件流进行读取
-            getdir(path, files);
+            getdir(path, files); ///< files存储的为 path下的所有文件的绝对路径
         }
 
-        /// 创建undistort去畸变核心类型，输入calibFile、gammaFile和vignetteFile，分别为仅小孔模型和光度模型
+        /// 创建undistort去畸变核心类型，输入calibFile、 gammaFile和 vignetteFile ，分别为仅小孔模型和光度模型
         undistort = Undistort::getUndistorterForFile(calibFile, gammaFile, vignetteFile);
 
-        /// 这里的尺寸相关的变量会在undistort里面做一个清晰的界定
-        widthOrg = undistort->getOriginalSize()[0];
-        heightOrg = undistort->getOriginalSize()[1];
-        width = undistort->getSize()[0];
-        height = undistort->getSize()[1];
+        widthOrg = undistort->getOriginalSize()[0];  ///< 原始图像的宽
+        heightOrg = undistort->getOriginalSize()[1]; ///< 原始图像的高
+        width = undistort->getSize()[0];             ///< 参数要求的宽
+        height = undistort->getSize()[1];            ///< 参数要求的高
 
-        // load timestamps if possible.
-        loadTimestamps();
+        loadTimestamps(); ///< 加载时间戳timestamps和曝光时间exposures
         printf("ImageFolderReader: got %d files in %s!\n", (int)files.size(), path.c_str());
     }
     ~ImageFolderReader() {
@@ -171,17 +177,30 @@ public:
     Eigen::VectorXf getOriginalCalib() { return undistort->getOriginalParameter().cast<float>(); }
     Eigen::Vector2i getOriginalDimensions() { return undistort->getOriginalSize(); }
 
+    /**
+     * @brief 设置单目相机参数K, W, H
+     *
+     * @param K 输出的内参矩阵
+     * @param w 输出的要求的宽
+     * @param h 输出的要求的高
+     */
     void getCalibMono(Eigen::Matrix3f &K, int &w, int &h) {
         K = undistort->getK().cast<float>();
         w = undistort->getSize()[0];
         h = undistort->getSize()[1];
     }
 
+    /**
+     * @brief 设置全局的相机参数
+     * @details
+     *  1. 从undistort中获取相机的内参矩阵和宽高
+     *  2. 计算金字塔层级，并根据0层参数设置金字塔层级上不同的内参 w,h,fx,fy,cx,cy,K,K_inv,fxi,fyi...
+     */
     void setGlobalCalibration() {
         int w_out, h_out;
         Eigen::Matrix3f K;
-        getCalibMono(K, w_out, h_out);
-        setGlobalCalib(w_out, h_out, K);
+        getCalibMono(K, w_out, h_out);   ///< 从undistort中获取相机的内参矩阵和宽高
+        setGlobalCalib(w_out, h_out, K); ///< 设置金字塔不同层的内参矩阵
     }
 
     int getNumImages() { return files.size(); }
@@ -200,8 +219,13 @@ public:
 
     MinimalImageB *getImageRaw(int id) { return getImageRaw_internal(id, 0); }
 
+    /// @brief ImageFolderReader的获取图像函数
+    /// @param id 输入的图像id
+    /// @param forceLoadDirectly
+    /// @return ImageAndExposure
     ImageAndExposure *getImage(int id, bool forceLoadDirectly = false) { return getImage_internal(id, 0); }
 
+    /// 获取 G_inv
     inline float *getPhotometricGamma() {
         if (undistort == 0 || undistort->photometricUndist == 0)
             return 0;
@@ -224,16 +248,14 @@ private:
             long readbytes = zip_fread(fle, databuffer, (long)widthOrg * heightOrg * 6 + 10000);
 
             if (readbytes > (long)widthOrg * heightOrg * 6) {
-                printf("read %ld/%ld bytes for file %s. increase buffer!!\n", readbytes,
-                       (long)widthOrg * heightOrg * 6 + 10000, files[id].c_str());
+                printf("read %ld/%ld bytes for file %s. increase buffer!!\n", readbytes, (long)widthOrg * heightOrg * 6 + 10000, files[id].c_str());
                 delete[] databuffer;
                 databuffer = new char[(long)widthOrg * heightOrg * 30];
                 fle = zip_fopen(ziparchive, files[id].c_str(), 0);
                 readbytes = zip_fread(fle, databuffer, (long)widthOrg * heightOrg * 30 + 10000);
 
                 if (readbytes > (long)widthOrg * heightOrg * 30) {
-                    printf("buffer still to small (read %ld/%ld). abort.\n", readbytes,
-                           (long)widthOrg * heightOrg * 30 + 10000);
+                    printf("buffer still to small (read %ld/%ld). abort.\n", readbytes, (long)widthOrg * heightOrg * 30 + 10000);
                     exit(1);
                 }
             }
@@ -245,10 +267,10 @@ private:
 #endif
         }
     }
-    
+
     /**
      * @brief 真正读取图像的操作函数，读取并进行光度矫正
-     * 
+     *
      * @param id        输入的图像id
      * @param unused    在这个函数里面并没有使用，但是在后续的getImageRaw_internal函数也没有使用，估计是设计有误
      * @return ImageAndExposure* 返回校正后的图像和曝光时间的参数
@@ -256,10 +278,10 @@ private:
     ImageAndExposure *getImage_internal(int id, int unused) {
         /// 返回的是uint8的图像信息
         MinimalImageB *minimg = getImageRaw_internal(id, 0);
-        
-        /// 这一部分的undistort仅仅是进行了光度矫正而已
-        ImageAndExposure *ret2 = undistort->undistort<unsigned char>(
-            minimg, (exposures.size() == 0 ? 1.0f : exposures[id]), (timestamps.size() == 0 ? 0.0 : timestamps[id]));
+
+        /// 这一部分的undistort进行了光度和畸变矫正，得到的是仅pinhole模型的图像ret2
+        ImageAndExposure *ret2 = undistort->undistort<unsigned char>(minimg, (exposures.size() == 0 ? 1.0f : exposures[id]),
+                                                                     (timestamps.size() == 0 ? 0.0 : timestamps[id]));
         delete minimg;
         return ret2;
     }
@@ -282,9 +304,9 @@ private:
             char buf[1000];
             tr.getline(buf, 1000);
 
-            int id;
-            double stamp;
-            float exposure = 0;
+            int id;             ///< 图片id
+            double stamp;       ///< 拍摄时间戳
+            float exposure = 0; ///< 图片曝光时间
 
             if (3 == sscanf(buf, "%d %lf %f", &id, &stamp, &exposure)) {
                 timestamps.push_back(stamp);
@@ -298,11 +320,11 @@ private:
         }
         tr.close();
 
-        // check if exposures are correct, (possibly skip)
+        /// 检查曝光时间是否合理，如果不合理则进行修正
         bool exposuresGood = ((int)exposures.size() == (int)getNumImages());
         for (int i = 0; i < (int)exposures.size(); i++) {
+            /// 将曝光时间为0的id-1和id+1的位置拿出来，进行平均值，作为当前曝光为0的曝光时间
             if (exposures[i] == 0) {
-                // fix!
                 float sum = 0, num = 0;
                 if (i > 0 && exposures[i - 1] > 0) {
                     sum += exposures[i - 1];
@@ -317,23 +339,25 @@ private:
                     exposures[i] = sum / num;
             }
 
+            /// 对于修正失败的部分，令 exposuresGood = false
             if (exposures[i] == 0)
                 exposuresGood = false;
         }
 
+        /// 如果timestamps和files的长度不相同，放弃当前的timestamps和exposures
         if ((int)getNumImages() != (int)timestamps.size()) {
             printf("set timestamps and exposures to zero!\n");
             exposures.clear();
             timestamps.clear();
         }
 
+        /// 如果exposures的长度与files的长度不相同，或者 exposuresGood为false，放弃当前的exposures
         if ((int)getNumImages() != (int)exposures.size() || !exposuresGood) {
             printf("set EXPOSURES to zero!\n");
             exposures.clear();
         }
 
-        printf("got %d images and %d timestamps and %d exposures.!\n", (int)getNumImages(), (int)timestamps.size(),
-               (int)exposures.size());
+        printf("got %d images and %d timestamps and %d exposures.!\n", (int)getNumImages(), (int)timestamps.size(), (int)exposures.size());
     }
 
     std::vector<ImageAndExposure *> preloadedImages;
