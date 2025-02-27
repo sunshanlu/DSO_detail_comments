@@ -64,11 +64,10 @@ void FullSystem::linearizeAll_Reductor(bool fixLinearization, std::vector<PointF
         (*stats)[0] += r->linearize(&Hcalib);
 
         if (fixLinearization) {
-            /// 将线性化的状态拷贝到EFResidual中，构建drk / dstate
+            /// 将线性化的状态拷贝到EFResidual中，构建Hfd（残差级别）
             r->applyRes(true);
 
             if (r->efResidual->isActive()) {
-                /// 这部分的isNew的检测，好像没有什么作用，因为每次构建滑窗优化时，都会进行重新的残差构建，所有残差都是new
                 if (r->isNew) {
                     /// 真实投影点pj和host depth 无穷大的虚拟投影点pj之间的距离 ---> 计算出一个relBS --> 以此来更新点p维护的最大maxline
                     PointHessian *p = r->point;
@@ -76,6 +75,7 @@ void FullSystem::linearizeAll_Reductor(bool fixLinearization, std::vector<PointF
                     Vec3f ptp = ptp_inf + r->host->targetPrecalc[r->target->idx].PRE_KtTll * p->idepth_scaled; // projected point with real depth.
                     float relBS = 0.01 * ((ptp_inf.head<2>() / ptp_inf[2]) - (ptp.head<2>() / ptp[2])).norm(); // 0.01 = one pixel.
 
+                    /// 我猜测这里是为了确定超参数来做的关键帧统计，即idepth_min=0条件下，idepth_max的最大取值范围（ImmaturePoint::idepth_max）
                     if (relBS > p->maxRelBaseline)
                         p->maxRelBaseline = relBS;
 
@@ -177,7 +177,8 @@ Vec3 FullSystem::linearizeAll(bool fixLinearization) {
         lastEnergyP = stats[0];
     }
 
-    setNewFrameEnergyTH(); ///< 设置新的帧能量阈值
+    /// 设置新的帧能量阈值
+    setNewFrameEnergyTH();
 
     if (fixLinearization) {
         /// 同步 PointHessian 维护的残差状态 ([0]上次 [1]上上次) --> 直接保存上次和上上次的残差指针，然后查不好吗？
@@ -221,6 +222,9 @@ Vec3 FullSystem::linearizeAll(bool fixLinearization) {
  *  1. 更新滑窗中的各种状态，根据优化得到的 delta_state 和 要求的步长
  *  2. 统计各种状态增量的均方值，用于后续判断是否优化已经充分
  *  3. 将滑动窗口中的预计算内容和各种状态增量进行更新
+ *
+ * @note 位姿更新部分，直接认定state_backup为小量是否合理？使用BCH公式更新state位姿增量是不是更好呢？
+ *
  * @param stepfacC  相机内参更新步长
  * @param stepfacT  位姿中平移向量更新步长
  * @param stepfacR  位姿中旋转向量更新步长
@@ -269,6 +273,8 @@ bool FullSystem::doStepFromBackup(float stepfacC, float stepfacT, float stepfacR
 
         /// 更新帧状态（帧位姿 和 帧仿射参数）
         for (FrameHessian *fh : frameHessians) {
+            /// 这里直接使用se3加的原因在于两个都是小量
+            //! 但是这里是否使用BCH公式更新比较妥当呢？有没有可能state_backup部分累计更新会逐渐增大导致Jl或者Jr近似称单位矩阵失败呢？
             fh->setState(fh->state_backup + pstepfac.cwiseProduct(fh->step));
             sumA += fh->step[6] * fh->step[6];
             sumB += fh->step[7] * fh->step[7];
@@ -379,6 +385,8 @@ void FullSystem::loadSateBackup() {
 /**
  * @brief 求解 HM 和 bM 对应的残差能量值
  *
+ * b * delta_x + 2 * delta_x^T * H * delta_x
+ *
  * @return double 返回的HM和bM对应的残差能量值
  */
 double FullSystem::calcMEnergy() {
@@ -436,6 +444,8 @@ float FullSystem::optimize(int mnumOptIts) {
     activeResiduals.clear();
     int numPoints = 0; ///< 滑窗中点的数量
     int numLRes = 0;   ///< 滑窗中已经线性化的残差数量，应该一直为0才对
+
+    /// 对于之前滑窗优化判断为内点的残差不需要再次进行线性化
     for (FrameHessian *fh : frameHessians)
         for (PointHessian *ph : fh->pointHessians) {
             for (PointFrameResidual *r : ph->residuals) {
@@ -455,7 +465,7 @@ float FullSystem::optimize(int mnumOptIts) {
     Vec3 lastEnergy = linearizeAll(false); ///< 这里面，新加入的res，都是非active状态
 
     /// 3. 根据初始状态，计算当前状态下的，所有线性化残差的能量值 和 HM和bM对应的系统能量值
-    double lastEnergyL = calcLEnergy(); ///< 滑窗系统中，所有线性化残差的能量值 ---> 这里只有帧状态先验和相机内参状态先验
+    double lastEnergyL = calcLEnergy(); ///< 滑窗系统中，之前保留的线性化残差的能量值增量 + 先验增量（源码里面貌似没有计算点的逆深度先验！）
     double lastEnergyM = calcMEnergy(); ///< 滑窗系统中，HM和bM对应的部分的能量值 --> 这里是HM和bM对应的先验（具有边缘化掉点的先验信息）
 
     /// 4. 计算新添加残差的Hfd部分
@@ -480,23 +490,31 @@ float FullSystem::optimize(int mnumOptIts) {
 
         /// 5.2 求解系统的优化问题 H * deltax = b，考虑先验 + HM + HA @see FullSystem::solveSystem
         solveSystem(iteration, lambda);
+
+        /// 两次状态增量的方向
         double incDirChange = (1e-20 + previousX.dot(ef->lastX)) / (1e-20 + previousX.norm() * ef->lastX.norm());
         previousX = ef->lastX;
 
-        //? TUM自己的解法???
+        /// 考虑了两次更新方向变化，更新比较保守，提高优化收敛的稳定性
         if (std::isfinite(incDirChange) && (setting_solverMode & SOLVER_STEPMOMENTUM)) {
+
+            /// 如果两次方向大于90°，则newStepSize < 1
+            /// 否则，newStepSize > 1
             float newStepsize = exp(incDirChange * 1.4);
+
+            /// 如果上次的更新步长大于1，但是这次的更新方向大于90°，则零stepsize=1
             if (incDirChange < 0 && stepsize > 1)
                 stepsize = 1;
 
             stepsize = sqrtf(sqrtf(newStepsize * stepsize * stepsize * stepsize));
+
             if (stepsize > 2)
                 stepsize = 2;
             if (stepsize < 0.25)
                 stepsize = 0.25;
         }
 
-        /// 5.3 根据当前状态和步长，计算不同状态的更新量，然后更新状态，并判断是否可以终止优化，并进行窗口状态预计算 --> 因为状态优化更新了
+        /// 5.3 根据当前状态和步长，计算不同状态的更新量，然后更新状态，并判断是否可以终止优化，并进行滑窗状态预计算 --> 因为状态优化更新了
         bool canbreak = doStepFromBackup(stepsize, stepsize, stepsize, stepsize, stepsize);
 
         /// 5.4 根据当前状态，重新计算新加入残差能量，线性化残差能量和HM和bM对应的系统能量值
@@ -551,7 +569,11 @@ float FullSystem::optimize(int mnumOptIts) {
     setPrecalcValues();        ///< 对于新计入的帧，构建预计算的值，并计算状态的相对增量（针对线性化点处，和先验点处）
 
     /// 8. 根据新加入的残差能量值，计算RMSE --> 均方根能量值 --> 精确到pattern上
-    lastEnergy = linearizeAll(true); ///< 根据优化后的状态，计算新加入的残差对应的能量值
+    /// 8.1 线性化新加入的残差值（这里是为了做FEJ，根据当前参数固定线性化点）
+    /// 8.2 统计需要被删除的非法残差，并进行非法残差的删除操作(pointHessian中维护的残差信息同步更新)
+    /// 8.3 统计maxRel，为后续确定ImmaturePoint确定一个极线搜索的范围
+    lastEnergy = linearizeAll(true);
+
     if (!std::isfinite((double)lastEnergy[0]) || !std::isfinite((double)lastEnergy[1]) || !std::isfinite((double)lastEnergy[2])) {
         /// 非法的能量值，导致跟跟踪丢失
         printf("KF Tracking failed: LOST!\n");
@@ -598,6 +620,8 @@ void FullSystem::solveSystem(int iteration, double lambda) {
 
 /**
  * @brief 计算滑窗系统中，所有已经线性化的残差的能量值 （使用最新的状态和FEJ，计算delta_rk --> 能量值）
+ * @details
+ *  1. 如果强制接受step 那么直接返回0 setting_forceAceptStep
  *
  * @return double   输出的系统能量值 (包含先验，但不包含HM和bM部分)
  */

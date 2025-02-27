@@ -89,6 +89,7 @@ PointFrameResidual::PointFrameResidual(PointHessian *point_, FrameHessian *host_
 double PointFrameResidual::linearize(CalibHessian *HCalib) {
     state_NewEnergyWithOutlier = -1;
 
+    /// 所有的残差都在一处判断岂不是更完美？
     if (state_state == ResState::OOB) {
         state_NewState = ResState::OOB;
         return state_energy;
@@ -199,7 +200,7 @@ double PointFrameResidual::linearize(CalibHessian *HCalib) {
 
         /// 上面求解 dpj / d delta_Tth(FEJ) 和 dpj / dK (非FEJ) 和 dpj / ddpi (FEJ)
         /// 下面求解 drk / dpj (非FEJ) 和 drk / d(-aji) 和 drk / d(-bji)
-        /// 并且对pattern的雅可比矩阵进行了加和处理 --> 但是由于pattern中点是不同的，并不清楚这具体代表的什么意义（意义不明）
+        /// 并且对pattern的雅可比矩阵进行了加和处理，DSO里面将dpj / dstate（FEJ）代替了pattern中的所有点
         if (!projectPoint(point->u + patternP[idx][0], point->v + patternP[idx][1], point->idepth_scaled, PRE_KRKiTll, PRE_KtTll, Ku, Kv)) {
             state_NewState = ResState::OOB;
             return state_energy;
@@ -220,7 +221,7 @@ double PointFrameResidual::linearize(CalibHessian *HCalib) {
             return state_energy;
         }
 
-        /// 这里权重考虑了 pi 在Ii梯度下的影响，也考虑了 pj 在Ij梯度下的影响，但是根据雅可比矩阵来看，貌似pi部分的像素梯度并不会影响整个优化过程
+        /// 这里权重考虑了 pi 在Ii梯度下的影响，也考虑了 pj 在Ij梯度下的影响
         /// 个人猜测，这里先假设 已经优化到pi 和 pj部分对应上了，
         /// 那么pi的梯度和pj的梯度应该差不多，但是如果这部分对应上的pi的梯度较大，且是外点的情况下，说明优化方向已经错误了
         float w = sqrtf(setting_outlierTHSumComponent / (setting_outlierTHSumComponent + hitColor.tail<2>().squaredNorm()));
@@ -233,7 +234,7 @@ double PointFrameResidual::linearize(CalibHessian *HCalib) {
         {
             if (hw < 1)
                 hw = sqrtf(hw);
-            hw = hw * w;
+            hw = hw * w; ///< 在雅可比矩阵体现了权重部分
 
             hitColor[1] *= hw; ///< 在uj部分的梯度 * 权重
             hitColor[2] *= hw; ///< 在vj部分的梯度 * 权重
@@ -268,10 +269,10 @@ double PointFrameResidual::linearize(CalibHessian *HCalib) {
         }
     }
 
-    J->JIdx2(0, 0) = JIdxJIdx_00;
-    J->JIdx2(0, 1) = JIdxJIdx_10;
-    J->JIdx2(1, 0) = JIdxJIdx_10;
-    J->JIdx2(1, 1) = JIdxJIdx_11;
+    J->JIdx2(0, 0) = JIdxJIdx_00; ///< sum (drk / duj) * (drk / duj)
+    J->JIdx2(0, 1) = JIdxJIdx_10; ///< sum (drk / dvj) * (drk / duj)
+    J->JIdx2(1, 0) = JIdxJIdx_10; ///< sum (drk / duj) * (drk / dvj)
+    J->JIdx2(1, 1) = JIdxJIdx_11; ///< sum (drk / dvj) * (drk / dvj)
     J->JabJIdx(0, 0) = JabJIdx_00;
     J->JabJIdx(0, 1) = JabJIdx_01;
     J->JabJIdx(1, 0) = JabJIdx_10;
@@ -330,9 +331,9 @@ void PointFrameResidual::debugPlot() {
  *  1. 拷贝了在线性化过程中求解的雅可比矩阵和求解雅可比矩阵的中间量
  *  2. 进一步计算了drk / dstate (位姿部分 、 仿射参数部分)
  *  3. 仅对内点做雅可比矩阵拷贝和计算操作
- * 
+ *
  * @see EFResidual::takeDataF
- * 
+ *
  * @param copyJacobians
  */
 void PointFrameResidual::applyRes(bool copyJacobians) {

@@ -110,7 +110,8 @@ bool CoarseInitializer::trackFrame(FrameHessian *newFrameHessian, std::vector<IO
     regWeight = 0.8;    ///< iR期望中位数的置信度
     couplingWeight = 1; ///< tji满足时，逆深度的正则化项部分系数
 
-    if (!snapped) /// 若 tji 没有达到 alphaW 和 alphaK 的要求，则需要进行一些修正
+    /// 若 tji 没有达到 alphaW 和 alphaK 的要求，则需要进行一些修正
+    if (!snapped) 
     {
         //! 初始化，这里的初始化直接全部重置，相当于去掉了之前优化的内容，是否会增加初始化时间的内容呢？
         thisToNext.translation().setZero(); ///< 1. 改变Tji中的平移向量，将之前优化的内容进行置0处理
@@ -186,7 +187,7 @@ bool CoarseInitializer::trackFrame(FrameHessian *newFrameHessian, std::vector<IO
             Hl = wM * Hl * wM * (0.01f / (w[lvl] * h[lvl])); ///< 针对x'的H矩阵
             bl = wM * bl * (0.01f / (w[lvl] * h[lvl]));      ///< 针对x'的b向量
 
-            ///! 使用边缘化后的Hsc和bsc进行增量计算，但是这里使用wM的方式，貌似没有出现应有的效果，因为后续使用wM系数矩阵又将优化增量部分映射回去了
+            /// 使用边缘化后的Hsc和bsc进行增量计算，但是这里使用wM的方式，是增强数值计算的稳定性
             Vec8f inc;
             if (fixAffine) ///< 考虑了a和b防射参数固定的情况，原理在于固定待优化量，其雅可比为0，索引可以直接将H矩阵中的某几块置0
             {

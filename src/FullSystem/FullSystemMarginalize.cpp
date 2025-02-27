@@ -56,7 +56,8 @@ namespace dso {
  * @details
  * 	1. 可以使用的点较少 in / (in + out) < 0.05
  * 	2. 与newFH之间，曝光参数差异较大 ---> 代表的环境变化较大
- * 	3. 在时间轴上，保证距离newFH较近的3帧不边缘化，并且在距离轴上，保证距离newFH较远的帧进行边缘化
+ * 	3. 在时间轴上，保证距离newFH较近的3帧不边缘化
+ *  4. 并且在距离轴上，保证距离newFH较远的帧进行边缘化，这个主要是通过启发式的得分实现
  * @param newFH	输入的关键帧
  */
 void FullSystem::flagFramesForMarginalization(FrameHessian *newFH) {
@@ -78,7 +79,7 @@ void FullSystem::flagFramesForMarginalization(FrameHessian *newFH) {
 
         Vec2 refToFh = AffLight::fromToVecExposure(frameHessians.back()->ab_exposure, fh->ab_exposure, frameHessians.back()->aff_g2l(), fh->aff_g2l());
 
-        /// (这一帧里的内点少 or 与newFH之间的曝光参数差的大) and (边缘化掉后还有5-7帧)，满足条件，则设置边缘化flag
+        /// (这一帧里的内点少 or 与newFH之间的曝光参数差的大,aji >= 0.7就需要被边缘化掉了，环境差异) and (边缘化掉后还有5-7帧)，满足条件，则设置边缘化flag
         if ((in < setting_minPointsRemaining * (in + out) || fabs(logf((float)refToFh[0])) > setting_maxLogAffFacInWindow) &&
             ((int)frameHessians.size()) - flagged > setting_minFrames) {
 

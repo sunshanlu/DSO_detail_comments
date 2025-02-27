@@ -47,7 +47,7 @@ float setting_initialAffAPrior = 1e14;
 float setting_initialCalibHessian = 5e9;
 
 /* some modes for solving the resulting linear system (e.g. orthogonalize wrt. unobservable dimensions) */
-int setting_solverMode = SOLVER_FIX_LAMBDA | SOLVER_ORTHOGONALIZE_X_LATER; /// 是否FEJ 和 正交投影的方式构建solver
+int setting_solverMode = SOLVER_FIX_LAMBDA | SOLVER_ORTHOGONALIZE_X_LATER; /// 固定lambda 和 正交投影的方式构建solver
 double setting_solverModeDelta = 0.00001;
 bool setting_forceAceptStep = true;
 

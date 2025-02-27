@@ -45,7 +45,7 @@ namespace dso {
  * @note 没有构建 H[(Tth,dpi)和(ath,dpi)和(bth,dpi)]
  * @note 目前仅 mode = 0 和 mode = 1部分完成了解读
  * @note 针对target不是最新关键帧的那些滑窗中的残差，也会走 mode = 0的分支！
- * 
+ *
  * @tparam mode 0 = active, 1 = linearized, 2=marginalize
  * @param p		输入的带有残差信息的能量点
  * @param ef	输入的维护滑窗的能量函数
@@ -90,7 +90,7 @@ template <int mode> void AccumulatedTopHessianSSE::addPoint(EFPoint *p, EnergyFu
             resApprox = rJ->resF;
 
         if (mode == 2)
-            resApprox = r->res_toZeroF;
+            resApprox = r->res_toZeroF; ///< 拿到在线性化点处的残差
 
         if (mode == 1) {
             /// 针对那些窗口中之前已经被线性化和激活的点，需要根据当前状态的变化，来更新rk，残差
@@ -303,8 +303,8 @@ void AccumulatedTopHessianSSE::stitchDoubleInternal(MatXX *H, VecX *b, EnergyFun
 
         /// 帧先验矩阵部分
         for (int h = 0; h < nframes[tid]; h++) {
-            H[tid].diagonal().segment<8>(CPARS + h * 8) += EF->frames[h]->prior;                               ///< 帧状态先验矩阵
-            b[tid].segment<8>(CPARS + h * 8) += EF->frames[h]->prior.cwiseProduct(EF->frames[h]->delta_prior); ///< 点状态先验矩阵
+            H[tid].diagonal().segment<8>(CPARS + h * 8) += EF->frames[h]->prior;                               ///< 帧状态先验对H矩阵的贡献
+            b[tid].segment<8>(CPARS + h * 8) += EF->frames[h]->prior.cwiseProduct(EF->frames[h]->delta_prior); ///< 帧状态先验对b矩阵的贡献
         }
     }
 }

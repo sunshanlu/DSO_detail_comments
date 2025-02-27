@@ -98,7 +98,7 @@ void FrameHessian::setStateZero(const Vec10 &state_zero) {
     w2c_leftEps_M_x0 = w2c_leftEps_M_x0 * get_worldToCam_evalPT().inverse();
     nullspaces_scale = (w2c_leftEps_P_x0.log() - w2c_leftEps_M_x0.log()) / (2e-3);
 
-    //? 仿射部分的零空间是怎么求出来的？
+    // 仿射参数应该没有零空间才对
     nullspaces_affine.setZero();
     nullspaces_affine.topLeftCorner<2, 1>() = Vec2(1, 0);
     assert(ab_exposure > 0);
@@ -200,6 +200,7 @@ void FrameHessian::makeImages(float *color, CalibHessian *HCalib) {
  *  2. host和target优化之后的位姿变换 Tth, Rth, tth
  *  3. 优化后，两帧之间的距离 distanceLL
  *  4. host帧上的像素变换到target帧上的中间量 KRKinv RK_inv Kt
+ *  5. aji和bji，以及bi
  *
  * @param host      输入的host帧
  * @param target    输入的target帧

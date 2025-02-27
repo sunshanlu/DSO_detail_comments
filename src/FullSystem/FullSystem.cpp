@@ -267,49 +267,65 @@ void FullSystem::printResult(std::string file) {
     myfile.close();
 }
 
-//@ 使用确定的运动模型对新来的一帧进行跟踪, 得到位姿和光度参数
+/**
+ * @brief 跟踪帧fh，确定位姿
+ *
+ * @note !!这里的光流计算是否可以等到跟踪结束后再做，这样的话可以完美避免重复计算光流的问题？
+ *
+ * @details
+ *  1. 构建不同尝试，包括恒速、倍速、半速、参考帧静止和26 * 3 种0平移小旋转组合
+ *  2. 遍历不同的fh初值，以找到一个跟踪成功的初始位姿
+ *      2.1 根据选定的位姿初值，进行优化跟踪 @see CoarseTracker::trackNewestCoarse
+ *      2.2 统计最优0层RMES能量值对应的位姿参数和光度参数
+ *      2.3 统计各层最优的能量值 achievedRes
+ *  3. 当跟踪成功，并且第0层的能量值小于 1.5 倍的上一次跟踪的0层RMSE能量值，则退出尝试
+ *  4. 保存当前的achievedRes，用于退出尝试的判断
+ *  5. 最后更新fh的位姿
+ *
+ * @param fh        输入的待跟踪的帧fh
+ * @return Vec4     输出的当前帧的跟踪状态[当前跟踪的第0层RMSE能量值、仅平移光流（trackNewestCoarse）、位姿光流（trackNewestCoarse）]
+ */
 Vec4 FullSystem::trackNewCoarse(FrameHessian *fh) {
 
     assert(allFrameHistory.size() > 0);
-    // set pose initialization.
 
     for (IOWrap::Output3DWrapper *ow : outputWrapper)
         ow->pushLiveFrame(fh);
 
-    FrameHessian *lastF = coarseTracker->lastRef; // 参考帧
+    FrameHessian *lastF = coarseTracker->lastRef; ///< 跟踪参考帧
+    AffLight aff_last_2_l = AffLight(0, 0);       ///< 上一帧的光度参数
 
-    AffLight aff_last_2_l = AffLight(0, 0);
-    //[ ***step 1*** ] 设置不同的运动状态
+    /// 设置不同的运动状态，恒速、2倍速、半速、0速和参考帧静止
     std::vector<SE3, Eigen::aligned_allocator<SE3>> lastF_2_fh_tries;
     printf("size: %d \n", lastF_2_fh_tries.size());
+
+    /// 考虑了仅两帧，无法实现的假设的状态（初始化成功的最少帧数）
     if (allFrameHistory.size() == 2)
         for (unsigned int i = 0; i < lastF_2_fh_tries.size(); i++)
-            lastF_2_fh_tries.push_back(SE3()); //? 这个size()不应该是0么
+            lastF_2_fh_tries.push_back(SE3());
+
     else {
-        FrameShell *slast = allFrameHistory[allFrameHistory.size() - 2];    // 上一帧
-        FrameShell *sprelast = allFrameHistory[allFrameHistory.size() - 3]; // 大上一帧
-        SE3 slast_2_sprelast;
-        SE3 lastF_2_slast;
-        { // lock on global pose consistency!
+        FrameShell *slast = allFrameHistory[allFrameHistory.size() - 2];    ///< 上一帧
+        FrameShell *sprelast = allFrameHistory[allFrameHistory.size() - 3]; ///< 上上帧
+
+        SE3 slast_2_sprelast; ///< 上上帧位姿和上一帧之间
+        SE3 lastF_2_slast;    ///< 上一帧位姿到参考帧
+        {
             boost::unique_lock<boost::mutex> crlock(shellPoseMutex);
-            slast_2_sprelast = sprelast->camToWorld.inverse() * slast->camToWorld;  // 上一帧和大上一帧的运动
-            lastF_2_slast = slast->camToWorld.inverse() * lastF->shell->camToWorld; // 参考帧到上一帧运动
+            slast_2_sprelast = sprelast->camToWorld.inverse() * slast->camToWorld;  ///< 上一帧和大上一帧的运动
+            lastF_2_slast = slast->camToWorld.inverse() * lastF->shell->camToWorld; ///< 参考帧到上一帧运动
             aff_last_2_l = slast->aff_g2l;
         }
-        SE3 fh_2_slast = slast_2_sprelast; // assumed to be the same as fh_2_slast. // 当前帧到上一帧 = 上一帧和大上一帧的
+        SE3 fh_2_slast = slast_2_sprelast;
 
-        //! 尝试不同的运动
-        // get last delta-movement.
-        lastF_2_fh_tries.push_back(fh_2_slast.inverse() * lastF_2_slast);                        // assume constant motion.
-        lastF_2_fh_tries.push_back(fh_2_slast.inverse() * fh_2_slast.inverse() * lastF_2_slast); // assume double motion (frame skipped)
-        lastF_2_fh_tries.push_back(SE3::exp(fh_2_slast.log() * 0.5).inverse() * lastF_2_slast);  // assume half motion.
-        lastF_2_fh_tries.push_back(lastF_2_slast);                                               // assume zero motion.
-        lastF_2_fh_tries.push_back(SE3());                                                       // assume zero motion FROM KF.
+        /// 尝试不同的运动假设
+        lastF_2_fh_tries.push_back(fh_2_slast.inverse() * lastF_2_slast);                        ///< 恒速运动假设
+        lastF_2_fh_tries.push_back(fh_2_slast.inverse() * fh_2_slast.inverse() * lastF_2_slast); ///< 2倍速运动假设
+        lastF_2_fh_tries.push_back(SE3::exp(fh_2_slast.log() * 0.5).inverse() * lastF_2_slast);  ///< 半速运动假设
+        lastF_2_fh_tries.push_back(lastF_2_slast);                                               ///< 0速运动假设
+        lastF_2_fh_tries.push_back(SE3());                                                       ///< 回到参考帧位姿假设
 
-        //! 尝试不同的旋转变动
-        // just try a TON of different initializations (all rotations). In the end,
-        // if they don't work they will only be tried on the coarsest level, which is super fast anyway.
-        // also, if tracking rails here we loose, so we really, really want to avoid that.
+        /// 尝试不同的旋转假设，一共26 * 3种
         for (float rotDelta = 0.02; rotDelta < 0.05; rotDelta++) {
             lastF_2_fh_tries.push_back(fh_2_slast.inverse() * lastF_2_slast *
                                        SE3(Sophus::Quaterniond(1, rotDelta, 0, 0), Vec3(0, 0, 0))); // assume constant motion.
@@ -365,8 +381,8 @@ Vec4 FullSystem::trackNewCoarse(FrameHessian *fh) {
                                        SE3(Sophus::Quaterniond(1, rotDelta, rotDelta, rotDelta), Vec3(0, 0, 0))); // assume constant motion.
         }
 
-        if (!slast->poseValid || !sprelast->poseValid || !lastF->shell->poseValid) // 有不和法的
-        {
+        /// 要求三个帧之间的位姿都是合法的，否则清除尝试的优化初值，并保留一个参考帧位姿假设
+        if (!slast->poseValid || !sprelast->poseValid || !lastF->shell->poseValid) {
             lastF_2_fh_tries.clear();
             lastF_2_fh_tries.push_back(SE3());
         }
@@ -376,57 +392,51 @@ Vec4 FullSystem::trackNewCoarse(FrameHessian *fh) {
     SE3 lastF_2_fh = SE3();
     AffLight aff_g2l = AffLight(0, 0);
 
-    //! as long as maxResForImmediateAccept is not reached, I'll continue through the options.
-    //! I'll keep track of the so-far best achieved residual for each level in achievedRes.
-    //! 把到目前为止最好的残差值作为每一层的阈值
-    //! If on a coarse level, tracking is WORSE than achievedRes, we will not continue to save time.
-    //! 粗层的能量值大, 也不继续优化了, 来节省时间
-
+    /// 用于维护成功尝试每层最优的残差值（RMSE能量值）
     Vec5 achievedRes = Vec5::Constant(NAN);
     bool haveOneGood = false;
     int tryIterations = 0;
-    //! 逐个尝试
-    for (unsigned int i = 0; i < lastF_2_fh_tries.size(); i++) {
-        //[ ***step 2*** ] 尝试不同的运动状态, 得到跟踪是否良好
-        AffLight aff_g2l_this = aff_last_2_l; // 上一帧的赋值当前帧
-        SE3 lastF_2_fh_this = lastF_2_fh_tries[i];
 
-        bool trackingIsGood = coarseTracker->trackNewestCoarse(fh, lastF_2_fh_this, aff_g2l_this, pyrLevelsUsed - 1,
-                                                               achievedRes); // in each level has to be at least as good as the last try.
+    /// 对不同的初值进行优化尝试
+    for (unsigned int i = 0; i < lastF_2_fh_tries.size(); i++) {
+        AffLight aff_g2l_this = aff_last_2_l;      ///< 当前帧光度参数优化初值
+        SE3 lastF_2_fh_this = lastF_2_fh_tries[i]; ///< 当前帧位姿优化初值
+
+        /// 使用参考帧和给定的尝试优化初值，进行跟踪优化 @see CoarseTracker::trackNewestCoarse
+        bool trackingIsGood = coarseTracker->trackNewestCoarse(fh, lastF_2_fh_this, aff_g2l_this, pyrLevelsUsed - 1, achievedRes);
         tryIterations++;
 
         if (i != 0) {
-            printf("RE-TRACK ATTEMPT %d with initOption %d and start-lvl %d (ab %f %f): %f %f %f %f %f -> %f %f %f %f "
-                   "%f \n",
-                   i, i, pyrLevelsUsed - 1, aff_g2l_this.a, aff_g2l_this.b, achievedRes[0], achievedRes[1], achievedRes[2], achievedRes[3], achievedRes[4],
+            printf("RE-TRACK ATTEMPT %d with initOption %d and start-lvl %d (ab %f %f): %f %f %f %f %f -> %f %f %f %f %f \n", i, i, pyrLevelsUsed - 1,
+                   aff_g2l_this.a, aff_g2l_this.b, achievedRes[0], achievedRes[1], achievedRes[2], achievedRes[3], achievedRes[4],
                    coarseTracker->lastResiduals[0], coarseTracker->lastResiduals[1], coarseTracker->lastResiduals[2], coarseTracker->lastResiduals[3],
                    coarseTracker->lastResiduals[4]);
         }
 
-        //[ ***step 3*** ] 如果跟踪正常, 并且0层残差比最好的还好留下位姿, 保存最好的每一层的能量值
-        // do we have a new winner?
-        if (trackingIsGood && std::isfinite((float)coarseTracker->lastResiduals[0]) && !(coarseTracker->lastResiduals[0] >= achievedRes[0])) {
-            // printf("take over. minRes %f -> %f!\n", achievedRes[0], coarseTracker->lastResiduals[0]);
+        /// 如果跟踪正常, 并且0层残差比最好的还好,则留下位姿, 保存最好的每一层的能量值（存储的都是最好的结果）
+        /// 也就是说，这段代码可以保证第一次跟踪成功的可以被留下来，因为achievedRes是NAN
+        if (trackingIsGood && std::isfinite((float)coarseTracker->lastResiduals[0]) && (coarseTracker->lastResiduals[0] < achievedRes[0])) {
             flowVecs = coarseTracker->lastFlowIndicators;
             aff_g2l = aff_g2l_this;
             lastF_2_fh = lastF_2_fh_this;
-            haveOneGood = true;
+
+            if (!haveOneGood)
+                haveOneGood = true;
         }
 
-        // take over achieved res (always).
-        if (haveOneGood) {
+        /// 保存的是成功尝试后，各层级最小的残差值，用于快速筛选某次尝试
+        if (haveOneGood)
             for (int i = 0; i < 5; i++) {
-                if (!std::isfinite((float)achievedRes[i]) ||
-                    achievedRes[i] > coarseTracker->lastResiduals[i]) // take over if achievedRes is either bigger or NAN.
-                    achievedRes[i] = coarseTracker->lastResiduals[i]; // 里面保存的是各层得到的能量值
+                if (!std::isfinite((float)achievedRes[i]) || achievedRes[i] > coarseTracker->lastResiduals[i])
+                    achievedRes[i] = coarseTracker->lastResiduals[i];
             }
-        }
 
-        //[ ***step 4*** ] 小于阈值则暂停, 并且为下次设置阈值
-        if (haveOneGood && achievedRes[0] < lastCoarseRMSE[0] * setting_reTrackThreshold)
+        /// 如果跟踪成功，并且在成功的基础上还能满足阈值要求，那么退出尝试，lastCoarseRMSE是上一次跟踪的最优结果
+        if (trackingIsGood && achievedRes[0] < lastCoarseRMSE[0] * setting_reTrackThreshold)
             break;
     }
 
+    /// 当所有的待尝试结果都尝试后，发现还是失败，那么宣告跟踪完全失败
     if (!haveOneGood) {
         printf("BIG ERROR! tracking failed entirely. Take predictred pose and hope we may somehow recover.\n");
         flowVecs = Vec3(0, 0, 0);
@@ -434,22 +444,21 @@ Vec4 FullSystem::trackNewCoarse(FrameHessian *fh) {
         lastF_2_fh = lastF_2_fh_tries[0];
     }
 
-    //! 把这次得到的最好值给下次用来当阈值
+    /// 将这次的跟踪结果进行保存，可能增大，也可能减小，但是在1.5倍的阈值范围内 (为后续的跟踪做准备)
     lastCoarseRMSE = achievedRes;
 
-    //[ ***step 5*** ] 此时shell在跟踪阶段, 没人使用, 设置值
-    // no lock required, as fh is not used anywhere yet.
+    /// 判断跟踪成功后，根据参考关键帧的位置进行位姿更新
     fh->shell->camToTrackingRef = lastF_2_fh.inverse();
     fh->shell->trackingRef = lastF->shell;
     fh->shell->aff_g2l = aff_g2l;
     fh->shell->camToWorld = fh->shell->trackingRef->camToWorld * fh->shell->camToTrackingRef;
 
+    /// 统计第一次跟踪成功的平均能量值
     if (coarseTracker->firstCoarseRMSE < 0)
-        coarseTracker->firstCoarseRMSE = achievedRes[0]; // 第一次跟踪的平均能量值
+        coarseTracker->firstCoarseRMSE = achievedRes[0];
 
     if (!setting_debugout_runquiet)
         printf("Coarse Tracker tracked ab = %f %f (exp %f). Res %f!\n", aff_g2l.a, aff_g2l.b, fh->ab_exposure, achievedRes[0]);
-
     if (setting_logStuff) {
         (*coarseTrackingLog) << std::setprecision(16) << fh->shell->id << " " << fh->shell->timestamp << " " << fh->ab_exposure << " "
                              << fh->shell->camToWorld.log().transpose() << " " << aff_g2l.a << " " << aff_g2l.b << " " << achievedRes[0] << " " << tryIterations
@@ -543,7 +552,7 @@ void FullSystem::activatePointsMT_Reductor(std::vector<PointHessian *> *optimize
  *  5. 对于 具有激活潜能的点，向 newestFH 上的金字塔1层投影，获取距离场对应的距离值
  *  6. 对未成熟点来讲，type--> 1, 2, 4分别代表0，1，2层提取的点--> 要求的距离会更加苛刻
  *  7. 对于那些投影过去看不到的点，认为是OOB点，直接删除
- *  8. 对于那些满足待激活条件，并且能够成功投影到 newestFH 的1层金字塔上，标注为待优化状态
+ *  8. 对于那些满足待激活条件，并且能够满足距离地图条件，标注为待优化状态
  *  9. 使用类LM方法对 未成熟点的逆深度进行优化（构建host --> target 上的残差)
  *  10. 对于优化成功的点，设置为激活状态，并且更新其idepth，lastResiduals和residuals
  *  11. 对于优化不成功的点，进行删除。
@@ -619,7 +628,7 @@ void FullSystem::activatePointsMT() {
             /// 针对当前无法激活的点，满足下面条件的，则进行删除处理，后续没有用了
             if (!canActivate) {
                 /// 1. 如果点的 host 帧被标记为即将边缘化 （以后也激活不了了）
-                /// 2. 或者当前点已经是OOB状态（两次外点，尺度变化大）
+                /// 2. 或者当前点已经是OOB状态（两次外点 || 尺度变化大 || 投影不到最新帧上）
                 if (ph->host->flaggedForMarginalization || ph->lastTraceStatus == IPS_OOB) {
                     delete ph;
                     host->immaturePoints[i] = 0;
@@ -679,9 +688,11 @@ void FullSystem::activatePointsMT() {
         }
         /// 对于没有优化成功的点或者OOB没参加优化的点，从host中删除后，析构掉
         else if (newpoint == (PointHessian *)((long)(-1)) || ph->lastTraceStatus == IPS_OOB) {
+            /// 对于线性化成功的点，单判断优化失败的点，进行了删除
             ph->host->immaturePoints[ph->idxInImmaturePoints] = 0;
             delete ph;
         } else {
+            /// 对于那些线性化失败的点，没有删除！！
             assert(newpoint == 0 || newpoint == (PointHessian *)((long)(-1)));
         }
     }
@@ -723,8 +734,7 @@ void FullSystem::flagPointsForRemoval() {
 
     int flag_oob = 0, flag_in = 0, flag_inin = 0, flag_nores = 0;
 
-    for (FrameHessian *host : frameHessians)
-    {
+    for (FrameHessian *host : frameHessians) {
         for (unsigned int i = 0; i < host->pointHessians.size(); i++) {
             PointHessian *ph = host->pointHessians[i];
             if (ph == 0)
@@ -754,6 +764,7 @@ void FullSystem::flagPointsForRemoval() {
 
                         /// 如果残差在线性化过程中，被认定为是内点，求解残差在 线性化点处 的残差值
                         if (r->efResidual->isActive()) {
+                            /// 只有这里会固定残差的线性化点，isLinearized会被置为true
                             r->efResidual->fixLinearizationF(ef);
                             ngoodRes++;
                         }
@@ -852,7 +863,6 @@ void FullSystem::addActiveFrame(ImageAndExposure *image, int id) {
             coarseTracker_forNewKF = tmp;
         }
 
-        // TODO 使用旋转和位移对像素移动的作用比来判断运动状态
         Vec4 tres = trackNewCoarse(fh);
         if (!std::isfinite((double)tres[0]) || !std::isfinite((double)tres[1]) || !std::isfinite((double)tres[2]) || !std::isfinite((double)tres[3])) {
             printf("Initial Tracking failed: LOST!\n");
@@ -868,21 +878,21 @@ void FullSystem::addActiveFrame(ImageAndExposure *image, int id) {
             Vec2 refToFh =
                 AffLight::fromToVecExposure(coarseTracker->lastRef->ab_exposure, fh->ab_exposure, coarseTracker->lastRef_aff_g2l, fh->shell->aff_g2l);
 
-            // BRIGHTNESS CHECK
-            needToMakeKF =
-                allFrameHistory.size() == 1 ||
-                setting_kfGlobalWeight * setting_maxShiftWeightT * sqrtf((double)tres[1]) / (wG[0] + hG[0]) +          // 平移像素位移
-                        setting_kfGlobalWeight * setting_maxShiftWeightR * sqrtf((double)tres[2]) / (wG[0] + hG[0]) +  // TODO 旋转像素位移, 设置为0???
-                        setting_kfGlobalWeight * setting_maxShiftWeightRT * sqrtf((double)tres[3]) / (wG[0] + hG[0]) + // 旋转+平移像素位移
-                        setting_kfGlobalWeight * setting_maxAffineWeight * fabs(logf((float)refToFh[0])) >
-                    1 ||                                      // 光度变化大
-                2 * coarseTracker->firstCoarseRMSE < tres[0]; // 误差能量变化太大(最初的两倍)
+            /// 1. 只有一个关键帧时，必须插入关键帧，这个判断条件不会出现，因为初始化过程会保证
+            /// 2. 像素的平均光流，不能变化太大，这时由位姿条件、仅位移条件的加权得来的，要我写的话，我会明确一个像素百分比作为阈值，比如3% * (wG[0] + hG[0])
+            /// 3. aji不能变化太大，这里我也会明确一个比例，比如说0.4
+            /// 4. 跟踪的误差能量RMSE不能变化太大，如果超过2倍的初始跟踪RMSE，则需要创建关键帧
+            needToMakeKF = (allFrameHistory.size() == 1) ||
+                setting_kfGlobalWeight * setting_maxShiftWeightT * sqrtf((double)tres[1]) / (wG[0] + hG[0]) + 
+                setting_kfGlobalWeight * setting_maxShiftWeightR * sqrtf((double)tres[2]) / (wG[0] + hG[0]) + 
+                setting_kfGlobalWeight * setting_maxShiftWeightRT * sqrtf((double)tres[3]) / (wG[0] + hG[0]) + 
+                setting_kfGlobalWeight * setting_maxAffineWeight * fabs(logf((float)refToFh[0])) > 1 ||
+                2 * coarseTracker->firstCoarseRMSE < tres[0];
         }
 
         for (IOWrap::Output3DWrapper *ow : outputWrapper)
             ow->publishCamPose(fh->shell, &Hcalib);
 
-        //[ ***step 7*** ] 把该帧发布出去
         lock.unlock();
         deliverTrackedFrame(fh, needToMakeKF);
         return;
@@ -1023,9 +1033,9 @@ void FullSystem::makeNonKeyFrame(FrameHessian *fh) {
 }
 
 /**
- * @brief 
- * 
- * @param fh 
+ * @brief
+ *
+ * @param fh
  */
 void FullSystem::makeKeyFrame(FrameHessian *fh) {
 
@@ -1047,6 +1057,7 @@ void FullSystem::makeKeyFrame(FrameHessian *fh) {
     boost::unique_lock<boost::mutex> lock(mapMutex);
 
     /// 3. 标记滑动窗口中，需要被边缘化的帧 @see FullSystem::flagFramesForMarginalization
+    /// 这个标记边缘化的帧是否可以放在滑动窗口优化之后去做，因为整个帧边缘化策略是滑窗后端的最后操作
     flagFramesForMarginalization(fh);
 
     /// 4. 把当前帧添加到滑动窗口 和 能量函数中
@@ -1062,10 +1073,12 @@ void FullSystem::makeKeyFrame(FrameHessian *fh) {
     /// 遍历滑动窗口内的帧 fh1
     int numFwdResAdde = 0;
     for (FrameHessian *fh1 : frameHessians) {
+        /// 这里continue的原因在于fh是新帧，没有成熟点ph
         if (fh1 == fh)
             continue;
 
         /// 构造滑动窗口内存在的 ph 和 当前帧fh的残差 对象，只不过这里还没有计算残差值
+        ///? 这里盲目构建现有点和新帧之间的残差对象是否合理？
         for (PointHessian *ph : fh1->pointHessians) {
             PointFrameResidual *r = new PointFrameResidual(ph, fh1, fh); ///< 这里仅构造了残差对象，没有实际计算
             r->setState(ResState::IN);
@@ -1108,7 +1121,7 @@ void FullSystem::makeKeyFrame(FrameHessian *fh) {
     /// 删除那些没有残差的点
     removeOutliers();
 
-    /// 设置 coarseTracker_forNewKF 的内参和残差帧
+    /// 设置 coarseTracker_forNewKF 的内参和参考帧
     {
         boost::unique_lock<boost::mutex> crlock(coarseTrackerSwapMutex);
         coarseTracker_forNewKF->makeK(&Hcalib);
@@ -1123,7 +1136,7 @@ void FullSystem::makeKeyFrame(FrameHessian *fh) {
     flagPointsForRemoval(); ///< 标记需要删除和边缘化的点
     ef->dropPointsF();      ///< 需要删除点，直接丢掉
 
-    /// 获取当前系统的零空间
+    ///! 获取当前系统的零空间，如何做到计算零空间的呢？？？
     getNullspaces(ef->lastNullspaces_pose, ef->lastNullspaces_scale, ef->lastNullspaces_affA, ef->lastNullspaces_affB);
 
     /// 边缘化掉点, 加在HM, bM上

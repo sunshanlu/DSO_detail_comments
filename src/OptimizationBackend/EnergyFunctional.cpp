@@ -69,7 +69,7 @@ void EnergyFunctional::setAdjointsF(CalibHessian *Hcalib) {
             Mat88 AT = Mat88::Identity(); ///< target delta --> global 到 local 的转换
 
             /// local --> global 的转换过程（位姿部分） https://www.cnblogs.com/JingeTU/p/9077372.html
-            //? 这里为什么会出现转置呢，结果好像没有这个转置吧
+            /// 这里事先转置，后续需要转置的地方比较多，因此放在这里整体装置，后面就不会做转置操作了
             AH.topLeftCorner<6, 6>() = -hostToTarget.Adj().transpose(); ///< delta_th / delta_h
             AT.topLeftCorner<6, 6>() = Mat66::Identity();               ///< delta_th / delta_t
 
@@ -80,7 +80,7 @@ void EnergyFunctional::setAdjointsF(CalibHessian *Hcalib) {
             AT(7, 7) = -1;        ///< d(-bth) / dbt
             AH(7, 7) = affLL[0];  ///< d(-bth) / dbh
 
-            /// 右乘 缩放的雅可比矩阵
+            /// 左乘系数矩阵 缩放的雅可比矩阵
             AH.block<3, 8>(0, 0) *= SCALE_XI_TRANS;
             AH.block<3, 8>(3, 0) *= SCALE_XI_ROT;
             AH.block<1, 8>(6, 0) *= SCALE_A;
@@ -173,6 +173,11 @@ EnergyFunctional::~EnergyFunctional() {
 /**
  * @brief 计算各种的增量 帧相对位姿增量，相机内参增量，帧状态相对于线性化点增量和相对于先验增量，点的逆深度相对线性化点增量
  * @details
+ *  1. 帧与帧之间的相对增量（相对于线性化点处的）
+ *  2. 相机内参的绝对增量（相对于线性化点处的）
+ *  3. 帧的绝对增量（相对于线性化点处的）
+ *  4. 帧的先验增量（相对于先验值处的）
+ *  5. 点的逆深度增量（相当于线性化点处的）
  *
  * @note 帧状态的相对增量，需要根据 dlocal / dhost 和 dlocal / dtarget进行计算
  *
@@ -244,6 +249,9 @@ void EnergyFunctional::accumulateAF_MT(MatXX &H, VecX &b, bool MT) {
  * @see AccumulatedTopHessianSSE::addPoint<1> --> 计算的FEJ条件下的rk变换和 '相对'的H矩阵和b矩阵
  * @see AccumulatedTopHessianSSE::stitchDoubleMT --> 将相对的H矩阵和b矩阵转换为绝对量，有可能加先验
  *
+ * @bug accSSE_top_L里面的addPoint<1>有些无用功，即Hl和bl矩阵（相对量）的构建，不需要构建
+ * @bug 除了addPoint<1>里面计算相对量的H和b矩阵为无用功外，accSSE_top_L->stitchDoubleMT函数的所有内容都是无用功（绝对转相对，后面没用上）
+ *
  * @param H     输出的线性化残差部分的H矩阵
  * @param b     输出的线性化残差部分的b矩阵
  * @param MT    多线程标识
@@ -258,8 +266,13 @@ void EnergyFunctional::accumulateLF_MT(MatXX &H, VecX &b, bool MT) {
         /// 初始化累加器
         accSSE_top_L->setZero(nFrames);
         for (EFFrame *f : frames)
-            for (EFPoint *p : f->points)
-                accSSE_top_L->addPoint<1>(p, this);                 ///< 针对滑窗中线性化和激活的残差，构建相对的H和b
+            for (EFPoint *p : f->points) {
+                /// 针对滑窗中线性化和激活的残差，构建相对的H和b
+                ///! accSSE_top_L里面的addPoint<1>有些无用功，即Hl和bl矩阵（相对量）的构建
+                accSSE_top_L->addPoint<1>(p, this);
+            }
+
+        //! 除了addPoint<1>里面计算相对量的H和b矩阵为无用功外，accSSE_top_L->stitchDoubleMT函数的所有内容都是无用功（绝对转相对，后面没用上）
         accSSE_top_L->stitchDoubleMT(red, H, b, this, true, false); ///< 将相对的H矩阵和b矩阵 转化为 绝对的H矩阵和b矩阵，不包含逆深度部分的转换
         resInL = accSSE_top_L->nres[0];
     }
@@ -403,6 +416,8 @@ double EnergyFunctional::calcMEnergyF() {
  *  3. 根据delta_pj, delta_aji, delta_bji 计算获得delta_rk
  *  4. 获取，由状态变化而得到的 '线性化的' 残差能量值 --> 不包含线性化点处的
  *
+ * @bug 这里直接使用残差的雅可比中间量貌似不正确，因为其雅可比还在缩放后的状态，得到的结果应该不是残差
+ *
  * @param min   多线程相关
  * @param max   多线程相关
  * @param stats 多线程状态
@@ -418,13 +433,14 @@ void EnergyFunctional::calcLEnergyPt(int min, int max, Vec10 *stats, int tid) {
         EFPoint *p = allPoints[i];
         float dd = p->deltaF;
 
-        /// 这里计算的残差能量，不包含新加入的残差
+        /// 计算已经完成线性化残差的能量值（最新状态） - 线性化残差能量值（FEJ状态）
         for (EFResidual *r : p->residualsAll) {
-            /// 这里正常来讲，应该没有激活且线性化的残差，也就说滑窗中的所有残差应该都是满足这个条件的，后续的内容不会走啊
             if (!r->isLinearized || !r->isActive())
                 continue;
 
             Mat18f dp = adHTdeltaF[r->hostIDX + nFrames * r->targetIDX];
+
+            //! 这里直接使用残差的雅可比中间量貌似不正确，因为其雅可比还在缩放后的状态，得到的结果应该不是残差（而是有这倍率关系了）
             RawResidualJacobian *rJ = r->J;
 
             float Jp_delta_x_1 = rJ->Jpdxi[0].dot(dp.head<6>()) + rJ->Jpdc[0].dot(dc) + rJ->Jpdd[0] * dd; ///< delta_xj
@@ -470,7 +486,7 @@ void EnergyFunctional::calcLEnergyPt(int min, int max, Vec10 *stats, int tid) {
  *  1. 计算 帧先验
  *  2. 计算 相机内参先验
  *  3. 计算 以线性化点处的雅可比 近似计算 delta_r，并计算去除线性化点处的残差能量值
- *  4. 计算 点逆深度的先验
+ *
  * @note 在计算系统残差过程中，由于使用了FEJ，需要使用线性化点处的雅可比近似，和欧拉积分的方式计算当前残差部分贡献的能量值 --> 会导致线性化误差
  * @return double 输出的系统的能量值
  */
@@ -489,7 +505,6 @@ double EnergyFunctional::calcLEnergyF_MT() {
     E += cDeltaF.cwiseProduct(cPriorF).dot(cDeltaF);
 
     /// 3.1 以线性化点处为基准，计算 (rf + delta_r)^2 - rf^2 ---> 残差能量相对于线性化点处的变化量
-    /// 3.2 针对那些具有先验的点，计算逆深度先验对应的能量 0.5 * (x - x_prior)^T * sigma * (x - x_prior)
     red->reduce(boost::bind(&EnergyFunctional::calcLEnergyPt, this, _1, _2, _3, _4), 0, allPoints.size(), 50);
 
     return E + red->stats[0];
@@ -551,9 +566,9 @@ EFFrame *EnergyFunctional::insertFrame(FrameHessian *fh, CalibHessian *Hcalib) {
     HM.rightCols<8>().setZero();
     HM.bottomRows<8>().setZero();
 
-    EFIndicesValid = false;  ///<
+    EFIndicesValid = false;  ///< 滑窗中的索引是否合法，加入新帧之后索引肯定不合法（并且也有被边缘化掉的帧）
     EFAdjointsValid = false; ///< setAdjointsF，以当前估计值为线性化点，计算 d_local / d_global --> true
-    EFDeltaValid = false;    ///< 当insertFrame运行成功后，只有DeltaValid为false
+    EFDeltaValid = false;    ///< 在setDeltaF函数中，会使得这部分为true
 
     /// 设置 d_local / d_global_t 和 d_loacl / d_global_h，用于后续local_delta --> global_delta
     setAdjointsF(Hcalib);
@@ -742,6 +757,7 @@ void EnergyFunctional::marginalizePointsF() {
         for (int i = 0; i < (int)f->points.size(); i++) {
             EFPoint *p = f->points[i];
             if (p->stateFlag == EFPointStatus::PS_MARGINALIZE) {
+                /// 点被marg掉后，先验会增大，相当于将这个点固定住（对那些已经优化的比较好的，且host帧不是被边缘化的点有作用）
                 p->priorF *= setting_idepthFixPriorMargFac;
                 for (EFResidual *r : p->residualsAll)
                     if (r->isActive())
@@ -761,7 +777,7 @@ void EnergyFunctional::marginalizePointsF() {
     }
     MatXX M, Msc;
     VecX Mb, Mbsc;
-    accSSE_top_A->stitchDouble(M, Mb, this, false, false); // 不加先验, 在后面加了
+    accSSE_top_A->stitchDouble(M, Mb, this, false, false);
     accSSE_bot->stitchDouble(Msc, Mbsc, this);
 
     resInM += accSSE_top_A->nres[0];
@@ -769,8 +785,7 @@ void EnergyFunctional::marginalizePointsF() {
     MatXX H = M - Msc;
     VecX b = Mb - Mbsc;
 
-    //[ ***step 3*** ] 处理零空间
-    // 减去零空间部分
+    /// 被边缘化留下的部分，去除零空间的影响
     if (setting_solverMode & SOLVER_ORTHOGONALIZE_POINTMARG) {
         // have a look if prior is there.
         bool haveFirstFrame = false;
@@ -782,8 +797,8 @@ void EnergyFunctional::marginalizePointsF() {
             orthogonalize(&b, &H);
     }
 
-    //! 给边缘化的量加了个权重，不准确的线性化
-    HM += setting_margWeightFac * H; //* 所以边缘化的部分直接加在HM bM了
+    /// 值得注意的是，边缘化的部分直接放到了HM和bM中去维护
+    HM += setting_margWeightFac * H;
     bM += setting_margWeightFac * b;
 
     if (setting_solverMode & SOLVER_ORTHOGONALIZE_FULL)
@@ -936,10 +951,13 @@ void EnergyFunctional::solveSystemF(int iteration, double lambda, CalibHessian *
     MatXX HL_top, HA_top, H_sc;
     VecX bL_top, bA_top, bM_top, b_sc;
 
-    /// 计算滑动窗口内所有的残差项，对应的H矩阵和b矩阵，并更新涉及到的p状态 Hdd_accAF, Hcd_accAF, bd_accAF
+    /// 计算滑动窗口内所有的残差项，对应的H矩阵和b矩阵，包含新线性化（activateResiduals）里面的残差构建 + 帧先验 + 内参先验
+    /// 帧先验（在初始化的一段时间内，可以防止漂移，当最初关键帧被marg掉后，漂移重新出现）
+    /// 内参先验（防零空间漂移）--> 可以从头防到尾（因此不需要零空间的计算）
     accumulateAF_MT(HA_top, bA_top, multiThreading);
 
-    /// 计算之前线性化过的残差，对应的H矩阵和b矩阵，并更新涉及到的p状态 Hdd_accLF, Hcd_accLF, bd_accLF，值应该是0，正常来讲应该被边缘化掉了
+    /// 计算之前线性化过的残差，对应的H矩阵和b矩阵，并更新涉及到的p状态 Hdd_accLF, Hcd_accLF, bd_accLF
+    //! 值得注意的是，accumulateLF_MT里面有部分内容无作用，并且相当耗时
     accumulateLF_MT(HL_top, bL_top, multiThreading);
 
     /// 计算 H_sc 和 b_sc 矩阵，这个Hsc和bsc是对当前滑窗内的活动残差的Schur，HA_top, bA_top部分的Schur矩阵
@@ -975,8 +993,8 @@ void EnergyFunctional::solveSystemF(int iteration, double lambda, CalibHessian *
 
         lastHS = HFinal_top;
         lastbS = bFinal_top;
-        // LM
-        //* 这个阻尼也是加在 Schur complement 计算之后的
+
+        /// 这个阻尼没加在逆深度更新量上，进加到了帧参数和相机内参上
         for (int i = 0; i < 8 * nFrames + CPARS; i++)
             HFinal_top(i, i) *= (1 + lambda);
 
@@ -992,7 +1010,8 @@ void EnergyFunctional::solveSystemF(int iteration, double lambda, CalibHessian *
         lastHS = HFinal_top - H_sc;
         lastbS = bFinal_top;
 
-        /// 对整个系统添加阻尼（包括逆深度点），然后再计算 schur 后的H 和 b矩阵 --> 注意整个系统添加阻尼 和 除了逆深度点部分添加阻尼是不同的
+        /// 对整个系统添加阻尼（包括逆深度点），然后再计算 schur 后的H 和 b矩阵
+        //! 注意整个系统添加阻尼 和 除了逆深度点部分添加阻尼是不同的
         for (int i = 0; i < 8 * nFrames + CPARS; i++)
             HFinal_top(i, i) *= (1 + lambda);
 
@@ -1002,13 +1021,13 @@ void EnergyFunctional::solveSystemF(int iteration, double lambda, CalibHessian *
     /// 求解 H * delta_x = b
     VecX x;
     if (setting_solverMode & SOLVER_SVD) {
-        //* 为数值稳定进行缩放
+        
+        /// 为数值稳定进行缩放
         VecX SVecI = HFinal_top.diagonal().cwiseSqrt().cwiseInverse();
         MatXX HFinalScaled = SVecI.asDiagonal() * HFinal_top * SVecI.asDiagonal();
         VecX bFinalScaled = SVecI.asDiagonal() * bFinal_top;
-        //! Hx=b --->  U∑V^T*x = b
-        Eigen::JacobiSVD<MatXX> svd(HFinalScaled, Eigen::ComputeThinU | Eigen::ComputeThinV);
 
+        Eigen::JacobiSVD<MatXX> svd(HFinalScaled, Eigen::ComputeThinU | Eigen::ComputeThinV);
         VecX S = svd.singularValues(); // 奇异值
         double minSv = 1e10, maxSv = 0;
         for (int i = 0; i < S.size(); i++) {
@@ -1018,7 +1037,6 @@ void EnergyFunctional::solveSystemF(int iteration, double lambda, CalibHessian *
                 maxSv = S[i];
         }
 
-        //! Hx=b --->  U∑V^T*x = b  --->  ∑V^T*x = U^T*b
         VecX Ub = svd.matrixU().transpose() * bFinalScaled;
         int setZero = 0;
         for (int i = 0; i < Ub.size(); i++) {
@@ -1032,12 +1050,9 @@ void EnergyFunctional::solveSystemF(int iteration, double lambda, CalibHessian *
             {
                 Ub[i] = 0;
                 setZero++;
-            }
-            //! V^T*x = ∑^-1*U^T*b
-            else
+            } else
                 Ub[i] /= S[i];
         }
-        //! x = V*∑^-1*U^T*b   把scaled的乘回来
         x = SVecI.asDiagonal() * svd.matrixV() * Ub;
 
     } else {
@@ -1058,7 +1073,11 @@ void EnergyFunctional::solveSystemF(int iteration, double lambda, CalibHessian *
     lastX = x;
 
     /// 根据求解的 帧参数增量 和 内参增量，进行逆深度增量的求解，逆深度的更新没有使用阻尼
+    //! 注意与上面整个系统加阻尼进行区分，即虽然在求H矩阵的时候是整个系统的阻尼，但是在求解逆深度时也可以忽略这个约束
+    //! 但是我认为，如果是一个系统都存在阻尼求解的H矩阵的话，那么这里求逆逆深度时，也同样应该加上阻尼才对
     currentLambda = lambda;
+    
+    /// 将优化得到的增量放入各自维护的step中（目前还带着尺度呢！）
     resubstituteF_MT(x, HCalib, multiThreading);
     currentLambda = 0;
 }
@@ -1082,6 +1101,7 @@ void EnergyFunctional::makeIDX() {
             allPoints.push_back(p);    ///< 把点加入到滑动窗口中
 
             /// 更新残差中维护的 host 和 target 的滑窗位置 idx（因为前面更新了滑动窗口中帧的位置）
+            /// 需要保证无用的残差全部删除干净了！！！
             for (EFResidual *r : p->residualsAll) {
                 r->hostIDX = r->host->idx;
                 r->targetIDX = r->target->idx;

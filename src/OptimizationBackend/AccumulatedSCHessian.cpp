@@ -83,15 +83,16 @@ void AccumulatedSCHessianSSE::addPoint(EFPoint *p, bool shiftPriorToZero, int ti
 
     int nFrames2 = nframes[tid] * nframes[tid];
 
-    ///! 这里是否可以，对某个host来讲，仅算一半，其余的一半先不算
     for (EFResidual *r1 : p->residualsAll) {
         if (!r1->isActive())
             continue;
+
         int r1ht = r1->hostIDX + r1->targetIDX * nframes[tid];
 
         for (EFResidual *r2 : p->residualsAll) {
             if (!r2->isActive())
                 continue;
+
             /// Hfd_1 * Hdd_inv * Hfd_2^T,  f = [xi, a b]位姿 光度 --> 边缘化掉Hfd_k
             /// 这部分获得的Hsc 对应的是 Hff 部分 (针对某个点的所有残差，构建的Hsc)
             accD[tid][r1ht + r2->targetIDX * nFrames2].update(r1->JpJdF, r2->JpJdF, p->HdiF);
@@ -100,7 +101,7 @@ void AccumulatedSCHessianSSE::addPoint(EFPoint *p, bool shiftPriorToZero, int ti
         /// Hfd * Hdd_inv * Hcd^T
         accE[tid][r1ht].update(r1->JpJdF, Hcd, p->HdiF);
 
-        /// Hfd * Hdd_inv * bd --> bfsc
+        /// Hfd * Hdd_inv * bd --> bdsc
         accEB[tid][r1ht].update(r1->JpJdF, p->HdiF * p->bdSumF);
     }
 }
@@ -148,10 +149,12 @@ void AccumulatedSCHessianSSE::stitchDoubleInternal(MatXX *H, VecX *b, EnergyFunc
             Hpc += accE[tid2][ijIdx].A1m.cast<double>();
             bp += accEB[tid2][ijIdx].A1m.cast<double>();
         }
-        //! Hfc部分Schur
+        
+        /// Hfc部分Schur
         H[tid].block<8, CPARS>(iIdx, 0) += EF->adHost[ijIdx] * Hpc;
         H[tid].block<8, CPARS>(jIdx, 0) += EF->adTarget[ijIdx] * Hpc;
-        //! 位姿,光度部分的残差Schur
+        
+        /// 位姿,光度部分的残差Schur
         b[tid].segment<8>(iIdx) += EF->adHost[ijIdx] * bp;
         b[tid].segment<8>(jIdx) += EF->adTarget[ijIdx] * bp;
 
@@ -181,8 +184,10 @@ void AccumulatedSCHessianSSE::stitchDoubleInternal(MatXX *H, VecX *b, EnergyFunc
         for (int tid2 = 0; tid2 < toAggregate; tid2++) {
             accHcc[tid2].finish();
             accbc[tid2].finish();
+            
             //! Hcc 部分Schur
             H[tid].topLeftCorner<CPARS, CPARS>() += accHcc[tid2].A1m.cast<double>();
+            
             //! 内参部分的残差Schur
             b[tid].head<CPARS>() += accbc[tid2].A1m.cast<double>();
         }

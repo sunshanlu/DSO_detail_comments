@@ -85,6 +85,7 @@ PointHessian *FullSystem::optimizeImmaturePoint(ImmaturePoint *point, int minObs
         residuals[i].state_energy = residuals[i].state_NewEnergy;
     }
 
+    /// return0 --> 线性化失败 || H矩阵太小不可信的
     if (!std::isfinite(lastEnergy) || lastHdd < setting_minIdepthH_act) {
         if (print)
             printf("OptPoint: Not well-constrained (%d res, H=%.1f). E=%f. SKIP!\n", nres, lastHdd, lastEnergy);

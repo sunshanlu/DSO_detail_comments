@@ -303,7 +303,7 @@ ImmaturePointStatus ImmaturePoint::traceOn(FrameHessian *frame, const Mat33f &ho
     /// ImmaturePoint 质量更新比较考究
     /// 1. 如果numSteps比较大，认为这个ImmaturePoint不够稳定，这时不论质量如何，都需要进行更新
     /// 2. 如果numSteps比较小，认为这个ImmaturePoint比较稳定，这时如果质量低于阈值，就进行更新
-    /// 以此来获得一个 质量高切稳定的 ImmaturePoint
+    /// 以此来获得一个 质量高且稳定的 ImmaturePoint
     float newQuality = secondBest / bestEnergy;
     if (newQuality < quality || numSteps > 10)
         quality = newQuality;

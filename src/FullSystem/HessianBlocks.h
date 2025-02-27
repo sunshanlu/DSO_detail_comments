@@ -42,7 +42,6 @@ inline Vec2 affFromTo(const Vec2 &from, const Vec2 &to) // contains affine param
     return Vec2(from[0] / to[0], (from[1] - to[1]) / to[0]);
 }
 
-// 提前声明下
 struct FrameHessian;
 struct PointHessian;
 
@@ -115,7 +114,7 @@ struct FrameHessian {
     static int instanceCounter; //!< 计数器
     int idx;                    ///< 在后端滑动窗口中的关键帧序号
 
-    float frameEnergyTH; //?< 这部分的阈值是干什么使的
+    float frameEnergyTH; ///< 根据残差计算的残差平均残差阈值，用于后续残差是否为outlier筛选
     float ab_exposure;   ///< 该帧的曝光时间
 
     bool flaggedForMarginalization; ///< 边缘化的标志
@@ -130,40 +129,51 @@ struct FrameHessian {
     Mat42 nullspaces_affine; ///< 仿射参数ab对应的零空间
     Vec6 nullspaces_scale;   ///< mono相机的尺度s对应的零空间
 
-    // variable info.
-    SE3 worldToCam_evalPT; //!< 在估计的相机位姿
-    // [0-5: 位姿左乘小量. 6-7: a,b 光度仿射系数]
-    //* 这三个是与线性化点的增量, 而光度参数不是增量, state就是值
-    Vec10 state_zero;   //!< 固定的线性化点的状态增量, 为了计算进行缩放
+    SE3 worldToCam_evalPT; ///< FEJ线性化状态点
+
+    Vec10 state_zero;
     Vec10 state_scaled; //!< 乘上比例系数的状态增量, 这个是真正求的值!!!
     Vec10 state;        //!< 计算的状态增量
+    
     //* step是与上一次优化结果的状态增量, [8 ,9]直接就设置为0了
     Vec10 step;         //!< 求解正规方程得到的增量
     Vec10 step_backup;  //!< 上一次的增量备份
     Vec10 state_backup; //!< 上一次状态的备份
 
-    // 内联提高效率, 返回上面的值
-    EIGEN_STRONG_INLINE const SE3 &get_worldToCam_evalPT() const { return worldToCam_evalPT; }
-    EIGEN_STRONG_INLINE const Vec10 &get_state_zero() const { return state_zero; }
-    EIGEN_STRONG_INLINE const Vec10 &get_state() const { return state; }
-    EIGEN_STRONG_INLINE const Vec10 &get_state_scaled() const { return state_scaled; }
-    EIGEN_STRONG_INLINE const Vec10 get_state_minus_stateZero() const { return get_state() - get_state_zero(); } // x小量可以直接减
-
     // precalc values
-    SE3 PRE_worldToCam; //!< 预计算的, 位姿状态增量更新到位姿上
+    SE3 PRE_worldToCam;
     SE3 PRE_camToWorld;
     std::vector<FrameFramePrecalc, Eigen::aligned_allocator<FrameFramePrecalc>> targetPrecalc; //!< 对于其它帧的预运算值
-    MinimalImageB3 *debugImage;                                                                //!< 小图???
+    MinimalImageB3 *debugImage;
 
-    inline Vec6 w2c_leftEps() const { return get_state_scaled().head<6>(); } //* 返回位姿状态增量
+    /// 获得关键帧的FEJ状态（位姿Tcw部分）
+    EIGEN_STRONG_INLINE const SE3 &get_worldToCam_evalPT() const { return worldToCam_evalPT; }
 
-    inline AffLight aff_g2l() const { return AffLight(get_state_scaled()[6], get_state_scaled()[7]); } //* 返回光度仿射系数
+    /// 获得state_zero（与 worldToCam_evalPT）共同构成了线性化点状态
+    EIGEN_STRONG_INLINE const Vec10 &get_state_zero() const { return state_zero; }
 
-    inline AffLight aff_g2l_0() const { return AffLight(get_state_zero()[6] * SCALE_A, get_state_zero()[7] * SCALE_B); } //* 返回线性化点处的仿射系数增量
+    /// 获取距离零空间位置的缩放状态的状态增量（[前六维为缩放状态的6维位姿左乘小量，然后是aj和bj的状态增量]）
+    EIGEN_STRONG_INLINE const Vec10 &get_state() const { return state; }
 
-    //* 设置FEJ点状态增量
+    /// 获取相对零空间位置的状态增量，即在state的基础上恢复了正确的增量尺度
+    EIGEN_STRONG_INLINE const Vec10 &get_state_scaled() const { return state_scaled; }
+
+    /// 用于获取相对线性化点的状态增量，以供帧状态相对量增量计算（global -> local）
+    EIGEN_STRONG_INLINE const Vec10 get_state_minus_stateZero() const { return get_state() - get_state_zero(); }
+
+    /// 返回位姿的状态增量
+    inline Vec6 w2c_leftEps() const { return get_state_scaled().head<6>(); }
+
+    /// 返回光度仿射参数
+    inline AffLight aff_g2l() const { return AffLight(get_state_scaled()[6], get_state_scaled()[7]); }
+
+    /// 返回线性化点处的仿射参数aj和bj（FEJ）
+    inline AffLight aff_g2l_0() const { return AffLight(get_state_zero()[6] * SCALE_A, get_state_zero()[7] * SCALE_B); }
+
+    /// 设置线性化状态量（位姿部分为0，由SE3 worldToCam_evalPT进行维护），并计算零空间
     void setStateZero(const Vec10 &state_zero);
-    //* 设置增量, 同时复制state和state_scale
+
+    /// 根据输入的相对线性化点处的增量，更新当前状态量并更新state和state_scaled
     inline void setState(const Vec10 &state) {
         this->state = state;
         state_scaled.segment<3>(0) = SCALE_XI_TRANS * state.segment<3>(0);
@@ -172,10 +182,10 @@ struct FrameHessian {
         state_scaled[7] = SCALE_B * state[7];
         state_scaled[8] = SCALE_A * state[8];
         state_scaled[9] = SCALE_B * state[9];
-        // 位姿更新
+
+        /// 位姿更新，相对于线性化点处进行更新！
         PRE_worldToCam = SE3::exp(w2c_leftEps()) * get_worldToCam_evalPT();
         PRE_camToWorld = PRE_worldToCam.inverse();
-        // setCurrentNullspace();
     };
 
     /**
@@ -514,7 +524,7 @@ struct PointHessian {
         if (lastResiduals[0].second == ResState::OOB)
             return true;
 
-        /// 残差比较少, 新加入的, 不边缘化
+        /// 残差比较少, 新加入的, 不边缘化，但是return false还需要判断吗？？？？，这不是无用代码吗？
         if (residuals.size() < 2)
             return false;
 

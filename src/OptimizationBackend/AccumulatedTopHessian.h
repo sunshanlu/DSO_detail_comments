@@ -87,7 +87,7 @@ public:
     template <int mode> void addPoint(EFPoint *p, EnergyFunctional const *const ef, int tid = 0);
 
     /**
-     * @brief 构建系统的H矩阵和b矩阵 （考虑了滑窗中产生的先验（内参 + 帧），但是还没有加上HM 和 bM）
+     * @brief 构建系统的H矩阵和b矩阵，但是还没有加上HM 和 bM，考虑了 内参 和 帧 的先验
      * @details
      *  1. 使用 AccumulatedTopHessianSSE::stitchDoubleInternal 构建了H矩阵 和 b矩阵，但是这里的H矩阵带有方向性，并不是真正的H矩阵
      *  2. 根据 AccumulatedTopHessianSSE::stitchDoubleInternal 的注释中分析的结果，构建完整的H矩阵
